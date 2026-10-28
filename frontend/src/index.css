@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  }
+}
+
+/* Protection anti-impression et filigrane de sécurité pour les messages classifiés */
+@media print {
+  .no-print-classified {
+    display: none !important;
+  }
+}
