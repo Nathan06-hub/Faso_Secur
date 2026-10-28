@@ -8,7 +8,7 @@ Conformément aux règles du sprint :
 """
 
 from sqlalchemy.orm import Session
-from auth import hash_password, pseudonymize_identifier
+from auth import get_timestamp_bucket, hash_password, pseudonymize_identifier
 from models import Channel, ChannelMember, EnrolledAgent, SecurityAuditLog
 
 DEMO_AGENTS = [
@@ -158,6 +158,7 @@ def seed_demo_data(db: Session) -> None:
                 "Initialisation souveraine FASO-SÉCUR : 5 agents fictifs enrôlés avec 2FA TOTP (RFC 6238) "
                 "et 4 canaux institutionnels E2EE activés."
             ),
+            timestamp_bucket=get_timestamp_bucket(),
         )
     )
     db.commit()

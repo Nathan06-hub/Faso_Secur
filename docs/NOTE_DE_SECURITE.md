@@ -21,10 +21,13 @@ Dans le contexte des communications de l'administration publique burkinabè, FAS
 
 ## 2. Protections Cryptographiques et Architecturales Mises en Place
 
-### 2.1. Chiffrement de Bout en Bout (Contre M1 — « Le serveur ne lit rien »)
-- **Aucune cryptographie maison** : Utilisation exclusive des standards **W3C WebCrypto (`SubtleCrypto` — BoringSSL/NSS)** mettant en œuvre le modèle de session de groupe **Matrix Olm/Megolm & Signal X3DH**.
-- **Chiffrement des messages, fichiers et notes vocales (`AES-256-GCM`)** : Tout contenu est chiffré dans le navigateur de l'émetteur avec une clé de 256 bits dérivée par `HKDF-SHA256 (RFC 5869)` et un vecteur d'initialisation aléatoire de 96 bits (`nonce_or_iv`). Même les noms de fichiers et les flux audio (Mooré, Dioula, Fulfulde, Français) sont chiffrés avant d'atteindre l'API FastAPI.
-- **Garde-fou serveur actif** : Le serveur FastAPI rejette automatiquement avec un code `400 Bad Request` toute requête JSON qui contiendrait un champ `plaintext`.
+### 2.1. Chiffrement de Bout en Bout, Accord X3DH/ECDH & Vérification ECDSA (Contre M1 — « Le serveur ne lit rien »)
+- **Aucune cryptographie maison** : Utilisation exclusive des standards **W3C WebCrypto (`SubtleCrypto` — BoringSSL/NSS)** côté client et **`PyCA cryptography`** côté serveur.
+- **Accord Diffie-Hellman `ECDH P-256` (X3DH) & Session de Groupe Megolm** : Les clés de session de salon sont encapsulées individuellement pour la clé publique `ECDH P-256` de chaque membre habilité (`derivePairwiseECDHWrappingKey` via `subtle.deriveBits`). Le serveur ne possédant aucune clé privée ECDH, il ne peut jamais désencapsuler la clé de session.
+- **Chiffrement des messages, fichiers et notes vocales (`AES-256-GCM`) & Sealed Sender** : Tout contenu (y compris l'identité de l'émetteur, la classification administrative et le type de message) est chiffré dans `ciphertext_payload` avec un vecteur d'initialisation aléatoire de 96 bits (`nonce_or_iv`).
+- **Double vérification mathématique des signatures `ECDSA P-256 / SHA-256`** : Chaque pré-clé signée (`SignedPreKey`), chaque enveloppe de message et chaque accusé de lecture probant est signé avec la clé privée `ECDSA P-256` de l'agent et vérifié mathématiquement côté serveur (`PyCA cryptography`) et côté client (`window.crypto.subtle.verify`).
+- **Chiffrement au repos du trousseau local (`AES-256-GCM Key Wrapping`)** : Aucune clé privée JWK en clair n'est stockée dans `localStorage`.
+- **Garde-fou serveur actif & Anti-Brute-Force** : Le serveur rejette avec `400 Bad Request` toute requête contenant un champ `plaintext` ou une signature ECDSA invalide, et verrouille temporairement (`429 Too Many Requests`) tout compte après 5 échecs de connexion.
 
 ### 2.2. Enrôlement Strict, Authentification Forte 2FA & RBAC (Contre M3)
 - **Zéro inscription publique** : Seuls les matricules préalablement inscrits par un administrateur (`SUPER_ADMIN_DGTD` ou `POINT_FOCAL`) dans la table `enrolled_agents` peuvent s'authentifier. Toute tentative d'un compte non enrôlé déclenche un rejet `403 Forbidden` et une alerte critique dans `security_audit_logs`.

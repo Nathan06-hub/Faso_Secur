@@ -7,11 +7,19 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=sqlite:///./data/faso_secur_sovereign.db
-      - FASO_SECUR_JWT_SECRET=bf-dgtd-sovereign-jwt-secret-key-2026-hackathon226
-      - FASO_SECUR_METADATA_PEPPER=bf-dgtd-metadata-minimization-pepper-2026
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/faso_secur_sovereign.db}
+      - FASO_SECUR_JWT_SECRET=${FASO_SECUR_JWT_SECRET:-bf-dgtd-sovereign-jwt-secret-key-2026-hackathon226}
+      - FASO_SECUR_METADATA_PEPPER=${FASO_SECUR_METADATA_PEPPER:-bf-dgtd-metadata-minimization-pepper-2026}
+      - FASO_SECUR_DEMO_MODE=${FASO_SECUR_DEMO_MODE:-true}
+      - FASO_SECUR_CORS_ORIGINS=${FASO_SECUR_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://msg.gouv.bf}
     volumes:
       - faso_secur_db_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   faso-secur-frontend:
@@ -25,7 +33,8 @@ services:
       - VITE_API_PROXY_TARGET=http://faso-secur-backend:8000
       - VITE_WS_PROXY_TARGET=ws://faso-secur-backend:8000
     depends_on:
-      - faso-secur-backend
+      faso-secur-backend:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

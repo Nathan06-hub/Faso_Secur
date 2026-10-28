@@ -32,6 +32,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import {
+  buildECDHWrappedGroupSessionBundles,
   decryptBinaryAttachmentE2EE,
   decryptE2EEMessagePayload,
   encryptBinaryAttachmentE2EE,
@@ -312,9 +313,33 @@ export default function App() {
 
     if (chRes.ok) {
       const chData = await chRes.json();
-      setChannels(chData.channels || []);
-      if (chData.channels?.length > 0 && !selectedChannelId) {
-        setSelectedChannelId(chData.channels[0].id);
+      const loadedChannels = chData.channels || [];
+      setChannels(loadedChannels);
+      if (loadedChannels.length > 0 && !selectedChannelId) {
+        setSelectedChannelId(loadedChannels[0].id);
+      }
+      if (keystore && loadedChannels.length > 0) {
+        for (const ch of loadedChannels) {
+          const wrapped = await buildECDHWrappedGroupSessionBundles({
+            channelId: ch.id,
+            cryptoEpoch: ch.crypto_epoch || 1,
+            activeMembers: ch.active_members || [],
+            keystore,
+          });
+          if (Object.keys(wrapped).length > 0) {
+            fetch(`${API_BASE}/api/channels/${ch.id}/group-session-bundle`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${jwt}`,
+              },
+              body: JSON.stringify({
+                crypto_epoch: ch.crypto_epoch || 1,
+                wrapped_keys_by_matricule: wrapped,
+              }),
+            }).catch(() => {});
+          }
+        }
       }
     }
     if (dirRes.ok) {
@@ -458,6 +483,10 @@ export default function App() {
       lang,
       senderMatricule: currentAgent.matricule,
       senderName: currentAgent.full_name,
+      senderMinistry: currentAgent.ministry,
+      senderRole: currentAgent.role,
+      classification,
+      messageKind: requiresReceipt ? 'SERVICE_INSTRUCTION' : 'TEXT',
       sentAtClient: new Date().toISOString(),
     };
 
@@ -606,6 +635,12 @@ export default function App() {
       voiceLang: voiceNoteLang,
       blobId: blobMeta.blob_id,
       sha256Ciphertext: blobMeta.sha256_ciphertext,
+      senderMatricule: currentAgent.matricule,
+      senderName: currentAgent.full_name,
+      senderMinistry: currentAgent.ministry,
+      senderRole: currentAgent.role,
+      classification,
+      messageKind,
       lang,
     };
 
@@ -1244,9 +1279,24 @@ export default function App() {
               ) : (
                 messages.map((msg) => {
                   const dec = decryptedMap[msg.id];
-                  const isMine = msg.sender_matricule === currentAgent.matricule;
-                  const isConfidentiel = msg.classification === 'CONFIDENTIEL';
-                  const isRestreint = msg.classification === 'DIFFUSION_RESTREINTE';
+                  const senderMatricule =
+                    dec?.content?.senderMatricule || msg.sender_matricule || msg.sender_pseudonym_hash;
+                  const senderName =
+                    dec?.content?.senderName || msg.sender_name || 'Agent Souverain (Sealed Sender)';
+                  const msgClassification =
+                    dec?.content?.classification ||
+                    (msg.classification && msg.classification !== 'SEALED_E2EE'
+                      ? msg.classification
+                      : 'ORDINAIRE');
+                  const msgKind =
+                    dec?.content?.messageKind ||
+                    (msg.message_kind && msg.message_kind !== 'SEALED_E2EE'
+                      ? msg.message_kind
+                      : 'TEXT');
+                  const isMine = senderMatricule === currentAgent.matricule;
+                  const isConfidentiel = msgClassification === 'CONFIDENTIEL';
+                  const isRestreint = msgClassification === 'DIFFUSION_RESTREINTE';
+                  const isSignatureValid = dec?.signatureVerified || msg.ecdsa_verified_by_server;
                   const hasSignedReceipt = msg.probative_receipts?.some(
                     (r) => r.agent_matricule === currentAgent.matricule
                   );
@@ -1273,16 +1323,21 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* En-tête du message : Émetteur + Badge de Classification + Époque E2EE */}
+                      {/* En-tête du message : Émetteur (Sealed Sender déchiffré) + Badge Classification + ECDSA */}
                       <div className="flex flex-wrap items-center justify-between gap-2 mb-2 relative z-10">
                         <div className="flex items-center gap-2">
-                          <span className="font-bold text-xs text-white">{msg.sender_name}</span>
+                          <span className="font-bold text-xs text-white">{senderName}</span>
                           <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-amber-300">
-                            {msg.sender_matricule}
+                            {senderMatricule}
                           </span>
                           <span className="text-[10px] text-slate-400">
                             Epoch #{msg.crypto_epoch}
                           </span>
+                          {isSignatureValid && (
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-700/50">
+                              ✓ ECDSA-P256 Vérifié
+                            </span>
+                          )}
                         </div>
 
                         <div className="flex items-center gap-1.5">
@@ -1295,7 +1350,7 @@ export default function App() {
                                 : 'bg-slate-800 text-emerald-300 border-slate-700'
                             }`}
                           >
-                            {msg.classification}
+                            {msgClassification}
                           </span>
                           {msg.expires_at && (
                             <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-red-950/80 text-red-300">
@@ -1337,7 +1392,7 @@ export default function App() {
                           <div className="flex items-center justify-between gap-2">
                             <div className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
                               <FileLock2 className="w-4 h-4" />
-                              {msg.message_kind === 'VOICE_NOTE'
+                              {msgKind === 'VOICE_NOTE'
                                 ? `Note vocale chiffrée E2EE (${dec?.content?.voiceLang || 'Langue nationale'})`
                                 : `Fichier chiffré E2EE : ${dec?.content?.fileName || msg.encrypted_blob_id}`}
                             </div>
@@ -1353,7 +1408,7 @@ export default function App() {
 
                           {decryptedBlobsMap[msg.encrypted_blob_id] && (
                             <div className="mt-2">
-                              {msg.message_kind === 'VOICE_NOTE' ? (
+                              {msgKind === 'VOICE_NOTE' ? (
                                 <audio
                                   controls
                                   src={decryptedBlobsMap[msg.encrypted_blob_id]}
