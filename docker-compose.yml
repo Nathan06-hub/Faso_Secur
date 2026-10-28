@@ -1,0 +1,32 @@
+services:
+  faso-secur-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: faso-secur-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./data/faso_secur_sovereign.db
+      - FASO_SECUR_JWT_SECRET=bf-dgtd-sovereign-jwt-secret-key-2026-hackathon226
+      - FASO_SECUR_METADATA_PEPPER=bf-dgtd-metadata-minimization-pepper-2026
+    volumes:
+      - faso_secur_db_data:/app/data
+    restart: unless-stopped
+
+  faso-secur-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: faso-secur-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_PROXY_TARGET=http://faso-secur-backend:8000
+      - VITE_WS_PROXY_TARGET=ws://faso-secur-backend:8000
+    depends_on:
+      - faso-secur-backend
+    restart: unless-stopped
+
+volumes:
+  faso_secur_db_data:
