@@ -8,7 +8,7 @@ Conformément aux règles du sprint :
 """
 
 from sqlalchemy.orm import Session
-from auth import get_timestamp_bucket, hash_password, pseudonymize_identifier
+from auth import encrypt_totp_secret_at_rest, get_timestamp_bucket, hash_password, pseudonymize_identifier
 from models import Channel, ChannelMember, EnrolledAgent, SecurityAuditLog
 
 DEMO_AGENTS = [
@@ -118,7 +118,7 @@ def seed_demo_data(db: Session) -> None:
             role=item["role"],
             preferred_lang=item["preferred_lang"],
             password_hash=hash_password(item["password"]),
-            totp_secret=item["totp_secret"],
+            totp_secret_encrypted=encrypt_totp_secret_at_rest(item["totp_secret"]),
             totp_enabled=True,
             is_enrolled_activated=True,
             is_revoked=False,
@@ -144,10 +144,11 @@ def seed_demo_data(db: Session) -> None:
 
     db.flush()
 
-    # Inscrire tous les agents enrôlés aux canaux de démonstration
+    # Inscrire les agents enrôlés aux canaux correspondant à leur ministère (ou interministériels 'TOUS')
     for channel in created_channels:
         for agent in created_agents:
-            db.add(ChannelMember(channel_id=channel.id, agent_id=agent.id))
+            if channel.ministry_scope == "TOUS" or channel.ministry_scope == agent.ministry:
+                db.add(ChannelMember(channel_id=channel.id, agent_id=agent.id))
 
     db.add(
         SecurityAuditLog(

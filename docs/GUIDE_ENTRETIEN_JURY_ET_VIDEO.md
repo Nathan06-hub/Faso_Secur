@@ -31,19 +31,18 @@
 
 Voici les **4 fonctions clés** que chaque membre de l'équipe doit connaître parfaitement :
 
-### 1. Chiffrement E2EE côté client : `encryptE2EEMessagePayload` dans [`frontend/src/crypto/e2eeEngine.js`](../frontend/src/crypto/e2eeEngine.js)
-- **Ce qu'elle fait** : Chiffre le message côté navigateur avant tout appel réseau vers FastAPI.
+### 1. Chiffrement E2EE côté client : `encryptE2EEMessagePayload` & `syncChannelGroupSecret` dans [`frontend/src/crypto/e2eeEngine.js`](../frontend/src/crypto/e2eeEngine.js)
+- **Ce qu'elles font** : Génèrent et échangent par `ECDH P-256` un secret de groupe aléatoire 256 bits (`CSPRNG`) par époque, puis chiffrent chaque message côté navigateur avant tout appel réseau vers FastAPI.
 - **Comment l'expliquer au jury** :
-  1. Elle appelle `deriveChannelMegolmSessionKey(channelId, cryptoEpoch)` qui utilise le standard **`HKDF-SHA256` (RFC 5869)** via `window.crypto.subtle.deriveKey` pour dériver une clé symétrique **`AES-256-GCM`** de 256 bits propre au canal et à son époque de révocation (`cryptoEpoch`).
-  2. Elle génère un vecteur d'initialisation aléatoire cryptographique de 96 bits (`12 octets`) via `window.crypto.getRandomValues(new Uint8Array(12))`.
-  3. Elle chiffre l'objet JSON du message avec `window.crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, ...)`, ce qui produit le texte chiffré + un tag d'intégrité GCM de 128 bits.
-  4. Elle signe l'enveloppe chiffrée avec la clé privée **`ECDSA P-256`** de l'agent émetteur (`window.crypto.subtle.sign`) pour garantir l'authenticité de l'émetteur.
+  1. `syncChannelGroupSecret` génère un secret aléatoire de 256 bits via `crypto.getRandomValues` (ou le désencapsule depuis le bundle publié par un pair) et l'encapsule pour chaque membre actif via un accord **`ECDH P-256`** (`subtle.deriveBits`) + **`HKDF-SHA256` (RFC 5869)** + **`AES-256-GCM`**.
+  2. `encryptE2EEMessagePayload` dérive la clé symétrique `AES-256-GCM` de l'époque via `HKDF-SHA256`, bourre le JSON du message par blocs de **256 octets** (`padPlaintextObjectTo256Bytes`), et le chiffre avec un IV aléatoire de 96 bits (`12 octets`).
+  3. Elle signe l'enveloppe (`channelId:cryptoEpoch:iv:ciphertext`) avec la clé privée **`ECDSA P-256`** de l'agent émetteur (`window.crypto.subtle.sign`). Cette signature est vérifiée obligatoirement par le serveur et par les clients destinataires contre la clé publique certifiée dans l'annuaire.
 
-### 2. Vérification du Second Facteur 2FA : `verify_totp_code` dans [`backend/auth.py`](../backend/auth.py)
-- **Ce qu'elle fait** : Vérifie le code à 6 chiffres du second facteur d'authentification selon le standard **RFC 6238 (TOTP)**.
+### 2. Vérification du Second Facteur 2FA & Chiffrement Fernet au repos : `verify_totp_code` dans [`backend/auth.py`](../backend/auth.py)
+- **Ce qu'elle fait** : Déchiffre en mémoire la graine TOTP stockée sous forme chiffrée **Fernet (`AES-128-CBC + HMAC-SHA256`)** en base, puis vérifie le code à 6 chiffres selon le standard **RFC 6238 (TOTP)**.
 - **Comment l'expliquer au jury** :
-  1. Elle décode le secret Base32 de l'agent enrôlé et instancie la classe officielle `TOTP` de la bibliothèque open source **`PyCA cryptography`** (`cryptography.hazmat.primitives.twofactor.totp.TOTP`) avec un pas de temps de 30 secondes (`time_step=30`) et l'algorithme `SHA1` standard RFC 6238.
-  2. Elle appelle `totp.verify(code_bytes, now + offset * 30)` avec une tolérance d'horloge de `±1` palier (30 s) pour valider le second facteur sans aucune cryptographie maison.
+  1. Elle appelle `decrypt_totp_secret_at_rest` (`cryptography.fernet.Fernet`) pour que jamais un secret 2FA ne soit stocké en clair dans SQLite/PostgreSQL.
+  2. Elle décode le secret Base32 et instancie la classe officielle `TOTP` de **`PyCA cryptography`** (`cryptography.hazmat.primitives.twofactor.totp.TOTP`) avec un pas de 30 secondes (`time_step=30`) et une tolérance de `±1` palier.
 
 ### 3. Contrôle d'accès et de révocation sur chaque requête : `verify_and_load_active_agent` dans [`backend/auth.py`](../backend/auth.py)
 - **Ce qu'elle fait** : Vérifie le jeton JWT sur chaque appel API et chaque connexion WebSocket.

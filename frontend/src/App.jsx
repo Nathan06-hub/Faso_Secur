@@ -32,7 +32,8 @@ import {
   WifiOff,
 } from 'lucide-react';
 import {
-  buildECDHWrappedGroupSessionBundles,
+  syncChannelGroupSecret,
+  hasGroupSecret,
   decryptBinaryAttachmentE2EE,
   decryptE2EEMessagePayload,
   encryptBinaryAttachmentE2EE,
@@ -105,6 +106,8 @@ export default function App() {
     return raw ? JSON.parse(raw) : null;
   });
   const [keystore, setKeystore] = useState(null);
+  const keystoreRef = useRef(null);
+  const [secretsVersion, setSecretsVersion] = useState(0);
   const [revokedLockdown, setRevokedLockdown] = useState(null);
 
   // Comptes de démo fictifs pour le jury
@@ -196,6 +199,7 @@ export default function App() {
     async function setupCryptoAndData() {
       const ks = await initializeAgentKeystore(currentAgent.matricule);
       if (!isMounted) return;
+      keystoreRef.current = ks;
       setKeystore(ks);
 
       // Publication des clés publiques E2EE de l'agent sur le serveur Zero-Knowledge
@@ -208,7 +212,7 @@ export default function App() {
         body: JSON.stringify(getPublicBundleForServer(ks)),
       });
 
-      await loadChannelsAndDirectory(token);
+      await loadChannelsAndDirectory(token, ks);
     }
 
     setupCryptoAndData();
@@ -238,7 +242,7 @@ export default function App() {
         if (data.type === 'GROUP_CRYPTO_EPOCH_ROTATED') {
           setSecurityBanner({
             type: 'EPOCH_ROTATED',
-            text: `Sécurité E2EE : L'agent ${data.revoked_matricule} a été révoqué (${data.reason}). Rotation immédiate des clés de session Megolm effectuée !`,
+            text: `Sécurité E2EE : L'agent ${data.revoked_matricule} a été révoqué (${data.reason}). Rotation immédiate des clés de session de groupe effectuée !`,
           });
           await loadChannelsAndDirectory(token);
           if (selectedChannelId) {
@@ -273,10 +277,12 @@ export default function App() {
   // Déchiffrement automatique côté client à chaque réception d'enveloppes chiffrées
   useEffect(() => {
     async function decryptAllVisibleMessages() {
+      const ch = channels.find((c) => c.id === selectedChannelId) || channels[0];
+      const activeMembers = ch?.active_members || directoryData.agents || [];
       const updates = {};
       for (const msg of messages) {
-        if (!decryptedMap[msg.id]) {
-          updates[msg.id] = await decryptE2EEMessagePayload(msg);
+        if (!decryptedMap[msg.id]?.decryptedOk) {
+          updates[msg.id] = await decryptE2EEMessagePayload(msg, activeMembers);
         }
       }
       if (Object.keys(updates).length > 0) {
@@ -286,7 +292,7 @@ export default function App() {
     if (messages.length > 0) {
       decryptAllVisibleMessages();
     }
-  }, [messages]);
+  }, [messages, secretsVersion, channels, selectedChannelId, directoryData.agents]);
 
   const handleRemoteRevocationLockdown = (reason) => {
     wipeLocalCryptoKeystore();
@@ -298,7 +304,7 @@ export default function App() {
     setRevokedLockdown(reason);
   };
 
-  const loadChannelsAndDirectory = async (jwt = token) => {
+  const loadChannelsAndDirectory = async (jwt = token, ks = keystoreRef.current) => {
     if (!jwt) return;
     const [chRes, dirRes] = await Promise.all([
       fetch(`${API_BASE}/api/channels`, { headers: { Authorization: `Bearer ${jwt}` } }),
@@ -318,28 +324,34 @@ export default function App() {
       if (loadedChannels.length > 0 && !selectedChannelId) {
         setSelectedChannelId(loadedChannels[0].id);
       }
-      if (keystore && loadedChannels.length > 0) {
+      if (ks && loadedChannels.length > 0) {
         for (const ch of loadedChannels) {
-          const wrapped = await buildECDHWrappedGroupSessionBundles({
-            channelId: ch.id,
-            cryptoEpoch: ch.crypto_epoch || 1,
-            activeMembers: ch.active_members || [],
-            keystore,
-          });
-          if (Object.keys(wrapped).length > 0) {
-            fetch(`${API_BASE}/api/channels/${ch.id}/group-session-bundle`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${jwt}`,
-              },
-              body: JSON.stringify({
-                crypto_epoch: ch.crypto_epoch || 1,
-                wrapped_keys_by_matricule: wrapped,
-              }),
-            }).catch(() => {});
+          const publish = async (bundles, initial) => {
+            try {
+              const r = await fetch(`${API_BASE}/api/channels/${ch.id}/group-session-bundle`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${jwt}`,
+                },
+                body: JSON.stringify({
+                  crypto_epoch: ch.crypto_epoch || 1,
+                  wrapped_keys_by_matricule: bundles,
+                  initial,
+                }),
+              });
+              return r.ok;
+            } catch {
+              return false;
+            }
+          };
+          try {
+            await syncChannelGroupSecret({ channel: ch, keystore: ks, publish });
+          } catch {
+            // Secret non disponible : réessayé à la prochaine synchronisation
           }
         }
+        setSecretsVersion((v) => v + 1);
       }
     }
     if (dirRes.ok) {
@@ -372,13 +384,19 @@ export default function App() {
     }
   }, [token, selectedChannelId]);
 
+  const [inspectionError, setInspectionError] = useState(null);
   const loadJuryInspectionData = async () => {
     if (!token) return;
+    setInspectionError(null);
     const res = await fetch(`${API_BASE}/api/jury/server-inspection`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (res.ok) {
       setInspectionData(await res.json());
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setInspectionData(null);
+      setInspectionError(err.detail || 'Accès réservé aux administrateurs DGTD / Auditeurs.');
     }
   };
 
@@ -477,6 +495,16 @@ export default function App() {
   const handleSendEncryptedText = async (e) => {
     e.preventDefault();
     if (!draftText.trim() || !keystore || !currentChannel) return;
+    if (!hasGroupSecret(currentChannel.id, currentChannel.crypto_epoch || 1)) {
+      await loadChannelsAndDirectory(token, keystore);
+      if (!hasGroupSecret(currentChannel.id, currentChannel.crypto_epoch || 1)) {
+        setSecurityBanner({
+          type: 'EPOCH_ROTATED',
+          text: 'Clé de groupe E2EE pas encore reçue : un membre actif doit se connecter pour vous l’envoyer. Message non envoyé.',
+        });
+        return;
+      }
+    }
 
     const plaintextObject = {
       text: draftText.trim(),
@@ -486,6 +514,8 @@ export default function App() {
       senderMinistry: currentAgent.ministry,
       senderRole: currentAgent.role,
       classification,
+      noForward: classification !== 'ORDINAIRE',
+      antiScreenshot: classification !== 'ORDINAIRE',
       messageKind: requiresReceipt ? 'SERVICE_INSTRUCTION' : 'TEXT',
       sentAtClient: new Date().toISOString(),
     };
@@ -499,10 +529,6 @@ export default function App() {
 
     const requestBody = {
       ...envelope,
-      message_kind: requiresReceipt ? 'SERVICE_INSTRUCTION' : 'TEXT',
-      classification,
-      no_forward: classification !== 'ORDINAIRE',
-      anti_screenshot: classification !== 'ORDINAIRE',
       requires_probative_receipt: requiresReceipt,
       expires_in_seconds: expiresInSeconds > 0 ? Number(expiresInSeconds) : null,
     };
@@ -640,6 +666,8 @@ export default function App() {
       senderMinistry: currentAgent.ministry,
       senderRole: currentAgent.role,
       classification,
+      noForward: classification !== 'ORDINAIRE',
+      antiScreenshot: classification !== 'ORDINAIRE',
       messageKind,
       lang,
     };
@@ -659,10 +687,6 @@ export default function App() {
       },
       body: JSON.stringify({
         ...envelope,
-        message_kind: messageKind,
-        classification,
-        no_forward: classification !== 'ORDINAIRE',
-        anti_screenshot: classification !== 'ORDINAIRE',
         requires_probative_receipt: requiresReceipt,
         encrypted_blob_id: blobMeta.blob_id,
       }),
@@ -789,7 +813,7 @@ export default function App() {
           <div className="bg-slate-950/90 border border-red-800/60 rounded-xl p-4 text-left text-xs text-slate-300 space-y-2 mb-6 font-mono">
             <div>✓ Connexion WebSocket temps réel coupée par le serveur souverain (Code 4003)</div>
             <div>✓ Jeton JWT invalidé sur l’ensemble des appareils (Token Version incrémentée)</div>
-            <div>✓ Signal REMOTE_WIPE exécuté : clés privées Olm/Megolm effacées du stockage local</div>
+            <div>✓ Signal REMOTE_WIPE exécuté : clés privées E2EE effacées du stockage local</div>
             <div>✓ Rotation de l’époque cryptographique (crypto_epoch) sur tous les groupes</div>
           </div>
           <button
@@ -1008,8 +1032,8 @@ export default function App() {
                 <Shield className="w-4 h-4 text-emerald-400" />
                 Socle de Sécurité Souverain Actif :
               </div>
-              <div>• Protocole E2EE : Matrix Olm/Megolm & Signal X3DH via W3C WebCrypto (AES-256-GCM / ECDH P-256 / HKDF)</div>
-              <div>• Second Facteur : TOTP RFC 6238 via PyCA Cryptography</div>
+              <div>• Protocole E2EE : Protocole de session de groupe inspiré de Signal/Megolm via W3C WebCrypto (ECDH P-256 / HKDF-SHA256 / AES-256-GCM / ECDSA)</div>
+              <div>• Second Facteur : TOTP RFC 6238 via PyCA Cryptography (Secret chiffré au repos via Fernet AES-128-CBC + HMAC)</div>
               <div>• Langues nationales intégrées : Français, Mooré, Dioula, Fulfulde + Notes vocales E2EE</div>
             </div>
           </div>
@@ -1195,7 +1219,7 @@ export default function App() {
                 Salons Chiffrés E2EE
               </span>
               <span className="text-[10px] font-mono bg-slate-800 px-2 py-0.5 rounded text-emerald-400">
-                Megolm
+                WebCrypto E2EE
               </span>
             </div>
 
@@ -1224,17 +1248,17 @@ export default function App() {
               ))}
             </div>
 
-            {/* Empreinte cryptographique locale de l'agent */}
+            {/* Empreinte cryptographique locale de l'agent (Numéro de Sécurité 30 chiffres) */}
             <div className="p-3 border-t border-slate-800 bg-slate-950/80 text-[11px] text-slate-400 space-y-1">
               <div className="font-semibold text-emerald-400 flex items-center gap-1">
                 <KeyRound className="w-3.5 h-3.5" />
                 Trousseau Local E2EE Actif
               </div>
-              <div className="font-mono text-[10px] truncate text-slate-500">
-                Sig: {keystore?.signedPreKeySignatureHex?.slice(0, 32)}...
+              <div className="font-mono text-[10px] text-amber-300" title="Numéro de sécurité (Safety Number) SHA-256 à 30 chiffres vérifiable hors-bande">
+                Empreinte: {keystore?.safetyNumber || 'Calcul en cours...'}
               </div>
               <div className="text-[10px] text-slate-500">
-                Clé privée stockée exclusivement dans ce navigateur.
+                Clé privée chiffrée en session exclusivement dans ce navigateur.
               </div>
             </div>
           </aside>
@@ -1248,7 +1272,7 @@ export default function App() {
                   <div className="flex items-center gap-2">
                     <h2 className="font-bold text-sm text-white">{currentChannel.name}</h2>
                     <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-700/60">
-                      Session Megolm Epoch #{currentChannel.crypto_epoch}
+                      Session de Groupe Epoch #{currentChannel.crypto_epoch}
                     </span>
                   </div>
                   <div className="text-xs text-slate-400 mt-0.5">
@@ -1305,7 +1329,7 @@ export default function App() {
                     <div
                       key={msg.id}
                       onCopy={(e) => {
-                        if (msg.no_forward || isConfidentiel || isRestreint) {
+                        if (dec?.content?.noForward || isConfidentiel || isRestreint) {
                           e.preventDefault();
                           alert('Copie interdite sur un message classifié Diffusion Restreinte / Confidentiel.');
                         }
@@ -1670,10 +1694,10 @@ export default function App() {
                     )}
                   </div>
 
-                  <div className="mt-3 pt-2.5 border-t border-slate-800 text-[11px] font-mono text-slate-400 flex items-center justify-between">
+                  <div className="mt-3 pt-2.5 border-t border-slate-800 text-[11px] font-mono text-slate-400 flex flex-wrap items-center justify-between gap-2">
                     <span>Rôle: {ag.role}</span>
-                    <span>
-                      Clé E2EE: {ag.e2ee_bundle?.signed_prekey_signature?.slice(0, 20) || 'Prête'}...
+                    <span className="text-amber-300" title="Numéro de sécurité (Safety Number) SHA-256 à 30 chiffres pour vérification hors-bande">
+                      Numéro de sécurité: {ag.safety_number || ag.e2ee_bundle?.safety_number || 'En attente de clé'}
                     </span>
                   </div>
                 </div>
@@ -1699,7 +1723,7 @@ export default function App() {
                 immédiatement l’accès, y compris aux nouveaux messages. » Cliquez sur{' '}
                 <strong>Révoquer immédiatement</strong> sur un agent (ex: <code className="text-amber-300">BF-MISSION-999</code>) :
                 sa session WebSocket est coupée instantanément, ses clés locales sont effacées (Remote Wipe),
-                et l’époque cryptographique Megolm du groupe est renouvelée.
+                et l’époque cryptographique E2EE du groupe est renouvelée.
               </p>
 
               <div className="space-y-3">
@@ -1854,26 +1878,34 @@ export default function App() {
               </button>
             </div>
 
+            {inspectionError && (
+              <div className="p-4 rounded-xl bg-red-950/60 border border-red-500 text-xs text-red-200">
+                {inspectionError}
+              </div>
+            )}
+
             {inspectionData && (
               <div className="space-y-5">
                 {/* Synthèse Zero-Knowledge & Minimisation des métadonnées */}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
                   <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
-                    <div className="text-slate-400">Colonnes en clair dans la BDD</div>
+                    <div className="text-slate-400">Colonnes en clair (vérifiées dynamiquement)</div>
                     <div className="text-xl font-extrabold text-emerald-400 mt-1">
-                      0 (Zéro Texte Clair)
+                      {inspectionData.plaintext_columns_in_db} (Zéro Texte Clair)
                     </div>
                   </div>
                   <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
-                    <div className="text-slate-400">Pseudonymisation des émetteurs</div>
+                    <div className="text-slate-400">Secrets 2FA TOTP en BDD</div>
                     <div className="text-sm font-bold text-amber-300 mt-1">
-                      HMAC-SHA256 (pseudo_...)
+                      {inspectionData.all_totp_secrets_encrypted_at_rest
+                        ? '100% Chiffrés au repos (Fernet AES-128)'
+                        : 'Vérification en cours'}
                     </div>
                   </div>
                   <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
-                    <div className="text-slate-400">Granularité temporelle & Blobs</div>
+                    <div className="text-slate-400">Granularité temporelle & Padding</div>
                     <div className="text-sm font-bold text-cyan-300 mt-1">
-                      Tranches de 5 min & Padding 4 Ko
+                      Tranches 5 min • Messages 256o / Blobs 4 Ko
                     </div>
                   </div>
                 </div>

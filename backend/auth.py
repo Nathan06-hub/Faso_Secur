@@ -1,13 +1,14 @@
 """
-Module d'Authentification Forte (2FA TOTP RFC 6238), de Vérification de Signatures
-Cryptographiques ECDSA P-256, de Rate-Limiting Brute-Force, de Révocation Immédiate
-et de Minimisation des Métadonnées pour FASO-SÉCUR.
+Module d'Authentification Forte (2FA TOTP RFC 6238 chiffré au repos par Fernet),
+de Vérification de Signatures Cryptographiques ECDSA P-256, de Rate-Limiting Brute-Force,
+de Révocation Immédiate et de Minimisation des Métadonnées pour FASO-SÉCUR.
 
 Bibliothèques Open Source utilisées (aucune cryptographie maison) :
 - `bcrypt` (Apache 2.0) : Hachage adaptatif des mots de passe administratifs
 - `cryptography` (Apache 2.0 / BSD - PyCA) :
-  - RFC 6238 TOTP (Second Facteur)
-  - Vérification cryptographique des signatures ECDSA P-256 (messages E2EE & accusés probants)
+  - `Fernet` (AES-128-CBC + HMAC-SHA256) : Chiffrement au repos des secrets `totp_secret` en BDD
+  - `TOTP` (RFC 6238) : Second facteur d'authentification
+  - `ec.SECP256R1` (ECDSA P-256 / SHA-256) : Vérification mathématique des signatures E2EE
 - `PyJWT` (MIT) : Jetons de session signés avec vérification de révocation en temps réel
 """
 
@@ -25,6 +26,7 @@ from typing import Dict, List, Optional
 import bcrypt
 import jwt
 from cryptography.exceptions import InvalidSignature
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
@@ -37,14 +39,22 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import EnrolledAgent
 
-# Clés serveur souveraines injectées par l'environnement (avec génération CSPRNG de secours)
-_DEFAULT_EPHEMERAL_JWT = secrets.token_urlsafe(48)
-JWT_SECRET_KEY = os.getenv("FASO_SECUR_JWT_SECRET", _DEFAULT_EPHEMERAL_JWT)
-METADATA_HMAC_PEPPER = os.getenv(
-    "FASO_SECUR_METADATA_PEPPER",
-    "bf-dgtd-metadata-minimization-pepper-2026",
-)
-DEMO_MODE_ENABLED = os.getenv("FASO_SECUR_DEMO_MODE", "true").lower() in ("1", "true", "yes")
+# Clés serveur générées par CSPRNG au démarrage si non injectées par l'environnement
+# (Aucun secret statique codé en dur dans le code source)
+JWT_SECRET_KEY = os.getenv("FASO_SECUR_JWT_SECRET") or secrets.token_urlsafe(48)
+METADATA_HMAC_PEPPER = os.getenv("FASO_SECUR_METADATA_PEPPER") or secrets.token_urlsafe(32)
+
+# Clé Fernet (32 octets encodés en Base64 URL-safe) pour chiffrer `totp_secret` au repos en BDD
+_RAW_FERNET_ENV = os.getenv("FASO_SECUR_TOTP_FERNET_KEY")
+if _RAW_FERNET_ENV:
+    _FERNET_KEY = base64.urlsafe_b64encode(hashlib.sha256(_RAW_FERNET_ENV.encode("utf-8")).digest())
+else:
+    _FERNET_KEY = Fernet.generate_key()
+
+_totp_fernet = Fernet(_FERNET_KEY)
+
+# Par défaut en production, DEMO_MODE est désactivé sauf si explicitement activé (ex: tests / démo jury)
+DEMO_MODE_ENABLED = os.getenv("FASO_SECUR_DEMO_MODE", "false").lower() in ("1", "true", "yes")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480
 
@@ -56,11 +66,6 @@ security_bearer = HTTPBearer(auto_error=False)
 # ============================================================================
 
 class LoginRateLimiter:
-    """
-    Bloque automatiquement un matricule après `max_attempts` échecs d'authentification
-    sur une fenêtre glissante de `window_seconds` secondes (HTTP 429 Too Many Requests).
-    """
-
     def __init__(self, max_attempts: int = 5, window_seconds: int = 300) -> None:
         self.max_attempts = max_attempts
         self.window_seconds = window_seconds
@@ -98,13 +103,11 @@ login_rate_limiter = LoginRateLimiter(max_attempts=5, window_seconds=300)
 # ============================================================================
 
 def hash_password(plain_password: str) -> str:
-    """Hache le mot de passe d'un agent avec un sel aléatoire via bcrypt."""
     salt = bcrypt.gensalt(rounds=12)
     return bcrypt.hashpw(plain_password.encode("utf-8"), salt).decode("utf-8")
 
 
 def verify_password(plain_password: str, password_hash: str) -> bool:
-    """Vérifie de manière résistante aux attaques temporelles le mot de passe avec bcrypt."""
     try:
         return bcrypt.checkpw(
             plain_password.encode("utf-8"),
@@ -115,13 +118,27 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
 
 
 # ============================================================================
-# 2. SECOND FACTEUR D'AUTHENTIFICATION (TOTP RFC 6238 via PyCA cryptography)
+# 2. SECOND FACTEUR 2FA TOTP (RFC 6238) & CHIFFREMENT AU REPOS FERNET
 # ============================================================================
 
 def generate_totp_secret() -> str:
     """Génère un secret TOTP de 160 bits encodé en Base32 conformément à la RFC 6238."""
     raw_secret = secrets.token_bytes(20)
     return base64.b32encode(raw_secret).decode("utf-8")
+
+
+def encrypt_totp_secret_at_rest(plain_base32_secret: str) -> str:
+    """
+    Chiffre le secret Base32 TOTP avec Fernet (AES-128-CBC + HMAC-SHA256 de PyCA cryptography)
+    avant son stockage en base de données (`totp_secret_encrypted`).
+    Un `SELECT * FROM enrolled_agents` ne révèle jamais le secret 2FA en clair.
+    """
+    return _totp_fernet.encrypt(plain_base32_secret.strip().encode("utf-8")).decode("utf-8")
+
+
+def decrypt_totp_secret_at_rest(encrypted_token: str) -> str:
+    """Déchiffre en mémoire vive le secret TOTP Fernet pour la vérification RFC 6238."""
+    return _totp_fernet.decrypt(encrypted_token.encode("utf-8")).decode("utf-8")
 
 
 def _build_pyca_totp(base32_secret: str) -> TOTP:
@@ -137,17 +154,31 @@ def _build_pyca_totp(base32_secret: str) -> TOTP:
     )
 
 
-def generate_current_totp_code(base32_secret: str, timestamp: Optional[float] = None) -> str:
-    """Génère le code TOTP à 6 chiffres pour l'instant courant (fenêtre de 30 secondes)."""
+def generate_current_totp_code(encrypted_or_plain_secret: str, timestamp: Optional[float] = None) -> str:
+    """Génère le code TOTP à 6 chiffres pour l'instant courant."""
+    base32_secret = (
+        decrypt_totp_secret_at_rest(encrypted_or_plain_secret)
+        if encrypted_or_plain_secret.startswith("gAAAAA")
+        else encrypted_or_plain_secret
+    )
     totp = _build_pyca_totp(base32_secret)
     ts = int(timestamp if timestamp is not None else time.time())
     return totp.generate(ts).decode("utf-8")
 
 
-def verify_totp_code(base32_secret: str, code: str, window: int = 1) -> bool:
-    """Vérifie un code TOTP à 6 chiffres selon la RFC 6238 (avec tolérance ±1 palier de 30s)."""
+def verify_totp_code(encrypted_or_plain_secret: str, code: str, window: int = 1) -> bool:
+    """Vérifie un code TOTP à 6 chiffres selon la RFC 6238 en déchiffrant d'abord le jeton Fernet."""
     if not code or not code.strip().isdigit() or len(code.strip()) != 6:
         return False
+    try:
+        base32_secret = (
+            decrypt_totp_secret_at_rest(encrypted_or_plain_secret)
+            if encrypted_or_plain_secret.startswith("gAAAAA")
+            else encrypted_or_plain_secret
+        )
+    except Exception:
+        return False
+
     totp = _build_pyca_totp(base32_secret)
     now = int(time.time())
     code_bytes = code.strip().encode("utf-8")
@@ -169,7 +200,7 @@ def build_otpauth_uri(matricule: str, ministry: str, base32_secret: str) -> str:
 
 
 # ============================================================================
-# 3. VÉRIFICATION CRYPTOGRAPHIQUE DES SIGNATURES ECDSA P-256 (PyCA cryptography)
+# 3. VÉRIFICATION CRYPTOGRAPHIQUE DES SIGNATURES ECDSA P-256 & SAFETY NUMBER
 # ============================================================================
 
 def _b64url_decode_to_int(b64url_str: str) -> int:
@@ -182,12 +213,11 @@ def verify_ecdsa_p256_jwk_signature(
     public_jwk_json: str,
     message_bytes: bytes,
     signature_hex: str,
-    prehashed_sha256: bool = False,
 ) -> bool:
     """
     Vérifie mathématiquement une signature ECDSA P-256 (format IEEE P1363 64 octets `r || s`
     issu de W3C WebCrypto ou format ASN.1 DER) avec la clé publique JWK de l'agent
-    en s'appuyant exclusivement sur `cryptography.hazmat.primitives.asymmetric.ec`.
+    enregistrée dans l'annuaire souverain (`current_agent.e2ee_signing_public_key`).
     """
     try:
         jwk = json.loads(public_jwk_json) if isinstance(public_jwk_json, str) else public_jwk_json
@@ -207,11 +237,26 @@ def verify_ecdsa_p256_jwk_signature(
         else:
             der_sig = sig_bytes
 
-        # WebCrypto applique SHA-256 lors de `subtle.sign({name: 'ECDSA', hash: 'SHA-256'}, key, data)`
         public_key.verify(der_sig, message_bytes, ec.ECDSA(hashes.SHA256()))
         return True
     except (InvalidSignature, ValueError, KeyError, TypeError):
         return False
+
+
+def compute_key_safety_number(matricule: str, identity_pub_json: str, signing_pub_json: str) -> str:
+    """
+    Calcule un Numéro de Sécurité (Safety Number) à 30 chiffres (6 blocs de 5 chiffres)
+    à partir du SHA-256 canonique du matricule et des clés publiques ECDH + ECDSA de l'agent.
+    Permet aux agents de comparer leurs empreintes hors-bande pour détecter toute substitution
+    de clé publique par un serveur compromis.
+    """
+    canonical = f"SAFETY_NUMBER_V1::{matricule.strip().upper()}::{identity_pub_json.strip()}::{signing_pub_json.strip()}"
+    digest = hashlib.sha256(canonical.encode("utf-8")).digest()
+    groups = []
+    for i in range(0, 24, 4):
+        val = int.from_bytes(digest[i : i + 4], byteorder="big") % 100000
+        groups.append(f"{val:05d}")
+    return " ".join(groups)
 
 
 # ============================================================================
@@ -284,10 +329,10 @@ def get_current_agent(
 
 
 def require_admin_role(current_agent: EnrolledAgent = Depends(get_current_agent)) -> EnrolledAgent:
-    if current_agent.role not in ("SUPER_ADMIN_DGTD", "POINT_FOCAL"):
+    if current_agent.role not in ("SUPER_ADMIN_DGTD", "POINT_FOCAL", "AUDITEUR"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Action réservée aux administrateurs habilités (DGTD / Point Focal Ministériel).",
+            detail="Action réservée aux administrateurs ou auditeurs habilités (DGTD / Point Focal).",
         )
     return current_agent
 

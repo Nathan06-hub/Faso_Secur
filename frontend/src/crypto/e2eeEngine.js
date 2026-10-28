@@ -1,25 +1,39 @@
 /**
  * ============================================================================
- * MOTEUR E2EE CLIENT-SIDE SOUVERAIN — PROTOCOLE MATRIX OLM/MEGOLM & SIGNAL X3DH
+ * MOTEUR E2EE CLIENT-SIDE SOUVERAIN — WEBCRYPTO (INSPIRÉ DE SIGNAL & MEGOLM)
  * ============================================================================
- * CONFORMITÉ TOTALE À L'AUDIT DE SÉCURITÉ :
- * 1. Aucune primitive cryptographique maison : 100 % W3C Web Cryptography API (`window.crypto.subtle`).
- * 2. Accord de clé Diffie-Hellman `ECDH P-256` (X3DH) réel entre paires d'agents :
- *    - `performECDHWrapGroupSessionKey` encapsule la clé de session Megolm pour la clé
- *      publique `ECDH P-256` de chaque membre via `subtle.deriveBits({ name: 'ECDH' })`.
- *    - Le serveur ne possède aucune clé privée ECDH et ne peut mathématiquement pas
- *      déchiffrer l'enveloppe de clé de session.
- * 3. Vérification systématique de la signature `ECDSA P-256 / SHA-256` à la réception
- *    côté client (`subtle.verify`) en plus de la vérification côté serveur (`PyCA cryptography`).
- * 4. Chiffrement au repos du trousseau de clés privées (`AES-256-GCM Key Wrapping`) :
- *    aucune clé privée en clair ne réside dans `localStorage`.
- * 5. Architecture Sealed Sender : l'identité de l'émetteur, la classification et le type
- *    de message sont encapsulés à l'intérieur du `ciphertext_payload`.
+ * ARCHITECTURE CRYPTOGRAPHIQUE HONNÊTE ET VÉRIFIABLE :
+ * - Ce module met en œuvre un protocole de chiffrement de bout en bout inspiré
+ *   de Signal (X3DH / Sender Keys) et de Matrix Megolm, construit exclusivement
+ *   sur les primitives standardisées et auditées du W3C Web Cryptography API
+ *   (`window.crypto.subtle` — BoringSSL/NSS) :
+ *     • Accord de clé Diffie-Hellman : `ECDH P-256` (`subtle.deriveBits`)
+ *     • Dérivation de clés de session : `HKDF-SHA256` (RFC 5869)
+ *     • Chiffrement authentifié : `AES-256-GCM` (nonce aléatoire 96 bits + tag 128 bits)
+ *     • Signatures numériques : `ECDSA P-256 / SHA-256`
+ * - Aucune primitive cryptographique « maison » n'est développée. L'architecture
+ *   est modulaire pour permettre le branchement direct de `@matrix-org/olm` (WASM)
+ *   en production.
+ *
+ * GARANTIES DE SÉCURITÉ IMPLÉMENTÉES :
+ * 1. Secret de groupe aléatoire 256 bits par époque (`crypto_epoch`), généré par
+ *    CSPRNG côté client et distribué uniquement sous forme d'enveloppes chiffrées
+ *    par accord `ECDH P-256` entre les clés des membres (indéchiffrable par le serveur).
+ * 2. Sealed Sender réel : ni `sender_id`, ni `sender_ephemeral_public_key`, ni
+ *    `no_forward`, ni `anti_screenshot`, ni `classification` ne sont transmis en clair.
+ * 3. Padding par blocs de 256 octets avant chiffrement `AES-256-GCM` pour masquer
+ *    la longueur exacte des messages.
+ * 4. Liaison cryptographique stricte à la réception : `decryptE2EEMessagePayload`
+ *    extrait le `senderMatricule` du payload déchiffré et vérifie la signature
+ *    `ECDSA P-256` (`authenticity_mac`) contre la clé publique d'annuaire de ce
+ *    matricule (`activeMembers`), empêchant toute usurpation d'identité entre membres.
+ * 5. Numéro de Sécurité (Safety Number à 30 chiffres) calculé par `SHA-256` sur les
+ *    clés publiques pour détecter hors-bande toute substitution de clé par le serveur.
  * ============================================================================
  */
 
-const KEYSTORE_PREFIX = 'faso_secur_e2ee_wrapped_ks_v2_';
-const SESSION_WRAP_KEY_NAME = 'faso_secur_volatile_wrap_secret';
+const KEYSTORE_PREFIX = 'faso_secur_e2ee_wrapped_ks_v3_';
+const SESSION_WRAP_KEY_NAME = 'faso_secur_volatile_csprng_wrap_key';
 
 function bytesToBase64(bytes) {
   let binary = '';
@@ -55,18 +69,43 @@ function hexToBytes(hex) {
 }
 
 /**
- * Dérive une clé de chiffrement locale (`AES-256-GCM`) pour protéger le trousseau
- * au repos dans le navigateur (Finding 3.7 de l'audit).
+ * Calcule le Numéro de Sécurité (Safety Number) à 30 chiffres (6 groupes de 5 chiffres)
+ * d'un agent à partir de son matricule et de ses clés publiques ECDH + ECDSA.
+ */
+export async function computeSafetyNumber(matricule, identityPublicJwk, signingPublicJwk) {
+  const idStr =
+    typeof identityPublicJwk === 'string' ? identityPublicJwk.trim() : JSON.stringify(identityPublicJwk);
+  const sigStr =
+    typeof signingPublicJwk === 'string' ? signingPublicJwk.trim() : JSON.stringify(signingPublicJwk);
+  const canonical = `SAFETY_NUMBER_V1::${matricule.trim().toUpperCase()}::${idStr}::${sigStr}`;
+  const digestBuf = await window.crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(canonical)
+  );
+  const digest = new Uint8Array(digestBuf);
+  const view = new DataView(digest.buffer);
+  const groups = [];
+  for (let i = 0; i < 24; i += 4) {
+    const val = view.getUint32(i, false) % 100000;
+    groups.push(String(val).padStart(5, '0'));
+  }
+  return groups.join(' ');
+}
+
+/**
+ * Dérive une clé de chiffrement locale (`AES-256-GCM`) à partir d'une graine aléatoire CSPRNG
+ * de 256 bits maintenue uniquement dans `sessionStorage` (détruite à la fermeture de l'onglet).
  */
 async function getLocalKeystoreWrappingKey(matricule) {
-  let volatileSeed = window.sessionStorage.getItem(SESSION_WRAP_KEY_NAME);
-  if (!volatileSeed) {
-    volatileSeed = `FASO-WRAP-KEY-${matricule}-SOVEREIGN-LOCAL`;
-    window.sessionStorage.setItem(SESSION_WRAP_KEY_NAME, volatileSeed);
+  let volatileSeedB64 = window.sessionStorage.getItem(`${SESSION_WRAP_KEY_NAME}_${matricule}`);
+  if (!volatileSeedB64) {
+    const randomSeed = window.crypto.getRandomValues(new Uint8Array(32));
+    volatileSeedB64 = bytesToBase64(randomSeed);
+    window.sessionStorage.setItem(`${SESSION_WRAP_KEY_NAME}_${matricule}`, volatileSeedB64);
   }
   const baseKey = await window.crypto.subtle.importKey(
     'raw',
-    new TextEncoder().encode(volatileSeed),
+    base64ToBytes(volatileSeedB64),
     { name: 'HKDF' },
     false,
     ['deriveKey']
@@ -87,8 +126,6 @@ async function getLocalKeystoreWrappingKey(matricule) {
 
 /**
  * 1. Initialisation ou déchiffrement du trousseau de clés E2EE local de l'agent.
- * Les clés privées sont chiffrées au repos par `AES-256-GCM` et ne sont jamais
- * transmises au serveur FastAPI.
  */
 export async function initializeAgentKeystore(matricule) {
   const storageKey = `${KEYSTORE_PREFIX}${matricule}`;
@@ -108,25 +145,22 @@ export async function initializeAgentKeystore(matricule) {
         return parsed;
       }
     } catch {
-      // Régénération si corrompu
+      // Si la clé volatile de session a changé, régénération propre ou re-scellement
     }
   }
 
-  // Paire de clés d'accord Diffie-Hellman (X3DH / Olm Identity Key — ECDH P-256)
   const dhKeyPair = await window.crypto.subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' },
     true,
     ['deriveKey', 'deriveBits']
   );
 
-  // Paire de clés de signature numérique (ECDSA P-256 pour pré-clés, messages & accusés probants)
   const signingKeyPair = await window.crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
     true,
     ['sign', 'verify']
   );
 
-  // Pré-clé signée (Signed PreKey X3DH — ECDH P-256)
   const signedPreKeyPair = await window.crypto.subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' },
     true,
@@ -140,7 +174,6 @@ export async function initializeAgentKeystore(matricule) {
   const signedPreKeyPublicJwk = await window.crypto.subtle.exportKey('jwk', signedPreKeyPair.publicKey);
   const signedPreKeyPrivateJwk = await window.crypto.subtle.exportKey('jwk', signedPreKeyPair.privateKey);
 
-  // Signature ECDSA P-256 de la pré-clé publique (vérifiée côté serveur par PyCA cryptography)
   const preKeyStr = JSON.stringify(signedPreKeyPublicJwk);
   const preKeyBytes = new TextEncoder().encode(preKeyStr);
   const signatureBuffer = await window.crypto.subtle.sign(
@@ -149,9 +182,11 @@ export async function initializeAgentKeystore(matricule) {
     preKeyBytes
   );
 
+  const safetyNumber = await computeSafetyNumber(matricule, identityPublicJwk, signingPublicJwk);
+
   const bundle = {
     matricule,
-    protocol: 'MATRIX_OLM_MEGOLM_X3DH_V2',
+    protocol: 'WEBCRYPTO_ECDH_HKDF_AES256GCM_ECDSA',
     identityPublicJwk,
     identityPrivateJwk,
     signingPublicJwk,
@@ -159,10 +194,10 @@ export async function initializeAgentKeystore(matricule) {
     signedPreKeyPublicJwk,
     signedPreKeyPrivateJwk,
     signedPreKeySignatureHex: bytesToHex(signatureBuffer),
+    safetyNumber,
     createdAt: new Date().toISOString(),
   };
 
-  // Chiffrement au repos du trousseau privé avant écriture dans localStorage
   const wrapIv = window.crypto.getRandomValues(new Uint8Array(12));
   const encryptedKeystoreBuf = await window.crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: wrapIv, tagLength: 128 },
@@ -174,7 +209,7 @@ export async function initializeAgentKeystore(matricule) {
     storageKey,
     JSON.stringify({
       encryptedAtRest: true,
-      alg: 'AES-256-GCM-WRAPPED',
+      alg: 'AES-256-GCM-CSPRNG-SESSION-WRAPPED',
       ivB64: bytesToBase64(wrapIv),
       ciphertextB64: bytesToBase64(encryptedKeystoreBuf),
     })
@@ -199,10 +234,7 @@ export function getPublicBundleForServer(keystore) {
 }
 
 /**
- * 2. Accord de clé Diffie-Hellman `ECDH P-256` (X3DH) entre deux agents (Finding 3.1 de l'audit).
- * Calcule un secret partagé 256 bits (`deriveBits`) entre la clé privée ECDH locale
- * et la clé publique ECDH d'un pair, puis dérive une clé d'encapsulage `AES-256-GCM` via `HKDF-SHA256`.
- * Le serveur ne possédant aucune clé privée ECDH, il ne peut JAMAIS calculer ce secret partagé.
+ * 2. Accord de clé Diffie-Hellman `ECDH P-256` entre deux agents.
  */
 export async function derivePairwiseECDHWrappingKey(myPrivateEcdhJwk, peerPublicEcdhJwk, channelId, cryptoEpoch) {
   const myPrivKey = await window.crypto.subtle.importKey(
@@ -220,7 +252,6 @@ export async function derivePairwiseECDHWrappingKey(myPrivateEcdhJwk, peerPublic
     []
   );
 
-  // Calcul mathématique Diffie-Hellman sur courbe elliptique P-256 (256 bits)
   const sharedSecretBits = await window.crypto.subtle.deriveBits(
     { name: 'ECDH', public: peerPubKey },
     myPrivKey,
@@ -239,8 +270,8 @@ export async function derivePairwiseECDHWrappingKey(myPrivateEcdhJwk, peerPublic
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt: new TextEncoder().encode(`X3DH-ECDH-CH-${channelId}-EP-${cryptoEpoch}`),
-      info: new TextEncoder().encode('MEGOLM_SESSION_KEY_WRAP_AES_256_GCM'),
+      salt: new TextEncoder().encode(`ECDH-WRAP-CH-${channelId}-EP-${cryptoEpoch}`),
+      info: new TextEncoder().encode('GROUP_SESSION_KEY_WRAP_AES_256_GCM'),
     },
     hkdfBaseKey,
     { name: 'AES-GCM', length: 256 },
@@ -249,84 +280,143 @@ export async function derivePairwiseECDHWrappingKey(myPrivateEcdhJwk, peerPublic
   );
 }
 
-/**
- * Génère et encapsule par `ECDH P-256` la clé de session Megolm du salon pour chaque membre actif
- * disposant d'une clé publique ECDH publiée.
- */
-export async function buildECDHWrappedGroupSessionBundles({
-  channelId,
-  cryptoEpoch,
-  activeMembers,
-  keystore,
-}) {
-  // Secret de session Megolm de 256 bits propre au canal et à son époque
-  const rawSessionSecret = new TextEncoder().encode(
-    `MEGOLM-GROUP-SECRET::CH=${channelId}::EPOCH=${cryptoEpoch}::SOVEREIGN-E2EE`
-  );
-  const sessionSeedBuffer = await window.crypto.subtle.digest('SHA-256', rawSessionSecret);
+// ----------------------------------------------------------------------------
+// SECRETS DE GROUPE (un secret ALÉATOIRE de 256 bits par canal et par époque)
+// Générés par CSPRNG sur le client, distribués uniquement sous forme
+// d'enveloppes ECDH P-256 individuelles. Conservés en mémoire vive uniquement.
+// ----------------------------------------------------------------------------
+const groupSecretStore = new Map();
+const gkey = (channelId, epoch) => `${channelId}:${epoch}`;
 
-  const wrappedByMatricule = {};
-  for (const member of activeMembers || []) {
-    if (!member.e2ee_identity_public_key) continue;
-    try {
-      const peerPubJwk = JSON.parse(member.e2ee_identity_public_key);
-      const pairwiseKey = await derivePairwiseECDHWrappingKey(
-        keystore.identityPrivateJwk,
-        peerPubJwk,
-        channelId,
-        cryptoEpoch
-      );
-      const wrapIv = window.crypto.getRandomValues(new Uint8Array(12));
-      const wrappedCipher = await window.crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv: wrapIv, tagLength: 128 },
-        pairwiseKey,
-        sessionSeedBuffer
-      );
-      wrappedByMatricule[member.matricule] = {
-        senderMatricule: keystore.matricule,
-        senderIdentityPubJwk: keystore.identityPublicJwk,
-        ivB64: bytesToBase64(wrapIv),
-        wrappedKeyB64: bytesToBase64(wrappedCipher),
-      };
-    } catch {
-      // Ignorer membre sans JWK valide
-    }
+export function hasGroupSecret(channelId, cryptoEpoch) {
+  return groupSecretStore.has(gkey(channelId, cryptoEpoch));
+}
+
+export function clearGroupSecrets() {
+  groupSecretStore.clear();
+}
+
+async function wrapSecretForMember({ secretBytes, channelId, cryptoEpoch, member, keystore }) {
+  const peerPubJwk = JSON.parse(member.e2ee_identity_public_key);
+  const pairwiseKey = await derivePairwiseECDHWrappingKey(
+    keystore.identityPrivateJwk,
+    peerPubJwk,
+    channelId,
+    cryptoEpoch
+  );
+  const wrapIv = window.crypto.getRandomValues(new Uint8Array(12));
+  const wrappedCipher = await window.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: wrapIv, tagLength: 128 },
+    pairwiseKey,
+    secretBytes
+  );
+  return {
+    senderMatricule: keystore.matricule,
+    ivB64: bytesToBase64(wrapIv),
+    wrappedKeyB64: bytesToBase64(wrappedCipher),
+  };
+}
+
+async function unwrapSecretFromBundle({ bundle, channelId, cryptoEpoch, activeMembers, keystore }) {
+  const sender = (activeMembers || []).find((m) => m.matricule === bundle.senderMatricule);
+  if (!sender?.e2ee_identity_public_key) return null;
+  try {
+    const pairwiseKey = await derivePairwiseECDHWrappingKey(
+      keystore.identityPrivateJwk,
+      JSON.parse(sender.e2ee_identity_public_key),
+      channelId,
+      cryptoEpoch
+    );
+    const unwrapped = await window.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: base64ToBytes(bundle.ivB64), tagLength: 128 },
+      pairwiseKey,
+      base64ToBytes(bundle.wrappedKeyB64)
+    );
+    return new Uint8Array(unwrapped);
+  } catch {
+    return null;
   }
-  return wrappedByMatricule;
 }
 
 /**
- * Dérive la clé de session de groupe Megolm (`AES-256-GCM`) via HKDF-SHA256 (RFC 5869),
- * en désencapsulant par `ECDH P-256` l'enveloppe du salon si présente.
+ * Synchronise le secret de groupe d'un canal via enveloppes ECDH P-256.
  */
-async function deriveChannelMegolmSessionKey(channelId, cryptoEpoch, ecdhBundleForMe = null, keystore = null) {
-  let seedBytes = null;
+export async function syncChannelGroupSecret({ channel, keystore, publish }) {
+  const channelId = channel.id;
+  const epoch = channel.crypto_epoch || 1;
+  const allBundles = channel.encrypted_group_session_bundles || {};
+  const members = channel.active_members || [];
 
-  if (ecdhBundleForMe && keystore?.identityPrivateJwk && ecdhBundleForMe.senderIdentityPubJwk) {
-    try {
-      const pairwiseKey = await derivePairwiseECDHWrappingKey(
-        keystore.identityPrivateJwk,
-        ecdhBundleForMe.senderIdentityPubJwk,
-        channelId,
-        cryptoEpoch
-      );
-      const unwrapped = await window.crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: base64ToBytes(ecdhBundleForMe.ivB64), tagLength: 128 },
-        pairwiseKey,
-        base64ToBytes(ecdhBundleForMe.wrappedKeyB64)
-      );
-      seedBytes = new Uint8Array(unwrapped);
-    } catch {
-      seedBytes = null;
-    }
+  for (const [epochKey, perMember] of Object.entries(allBundles)) {
+    const ep = Number(epochKey);
+    const mine = perMember?.[keystore.matricule];
+    if (!mine || hasGroupSecret(channelId, ep)) continue;
+    const secret = await unwrapSecretFromBundle({
+      bundle: mine,
+      channelId,
+      cryptoEpoch: ep,
+      activeMembers: members,
+      keystore,
+    });
+    if (secret) groupSecretStore.set(gkey(channelId, ep), secret);
   }
 
+  const currentBundles = allBundles[String(epoch)] || {};
+  const withKeys = members.filter((m) => m.e2ee_identity_public_key);
+
+  if (!hasGroupSecret(channelId, epoch)) {
+    if (Object.keys(currentBundles).length > 0) return false;
+    const fresh = window.crypto.getRandomValues(new Uint8Array(32));
+    const bundles = {};
+    for (const m of withKeys) {
+      try {
+        bundles[m.matricule] = await wrapSecretForMember({
+          secretBytes: fresh,
+          channelId,
+          cryptoEpoch: epoch,
+          member: m,
+          keystore,
+        });
+      } catch {
+        // membre sans JWK valide
+      }
+    }
+    if (!bundles[keystore.matricule]) return false;
+    const accepted = await publish(bundles, true);
+    if (accepted) groupSecretStore.set(gkey(channelId, epoch), fresh);
+    return accepted;
+  }
+
+  const missing = withKeys.filter((m) => !currentBundles[m.matricule]);
+  if (missing.length > 0) {
+    const secret = groupSecretStore.get(gkey(channelId, epoch));
+    const bundles = {};
+    for (const m of missing) {
+      try {
+        bundles[m.matricule] = await wrapSecretForMember({
+          secretBytes: secret,
+          channelId,
+          cryptoEpoch: epoch,
+          member: m,
+          keystore,
+        });
+      } catch {
+        // ignorer
+      }
+    }
+    if (Object.keys(bundles).length > 0) await publish(bundles, false);
+  }
+  return true;
+}
+
+/**
+ * Dérive la clé AES-256-GCM de session (HKDF-SHA256, RFC 5869) à partir du secret
+ * de groupe aléatoire de l'époque.
+ */
+async function deriveChannelGroupSessionKey(channelId, cryptoEpoch) {
+  const seedBytes = groupSecretStore.get(gkey(channelId, cryptoEpoch));
   if (!seedBytes) {
-    const rawSessionSecret = new TextEncoder().encode(
-      `MEGOLM-GROUP-SECRET::CH=${channelId}::EPOCH=${cryptoEpoch}::SOVEREIGN-E2EE`
-    );
-    const digest = await window.crypto.subtle.digest('SHA-256', rawSessionSecret);
-    seedBytes = new Uint8Array(digest);
+    throw new Error('Secret de groupe indisponible pour cette époque (accès non autorisé ou non synchronisé).');
   }
 
   const rawKeyMaterial = await window.crypto.subtle.importKey(
@@ -338,7 +428,7 @@ async function deriveChannelMegolmSessionKey(channelId, cryptoEpoch, ecdhBundleF
   );
 
   const salt = new TextEncoder().encode(`BF-DGTD-SALT-CH-${channelId}-EP-${cryptoEpoch}`);
-  const info = new TextEncoder().encode('MATRIX_MEGOLM_AES_256_GCM_SESSION_KEY');
+  const info = new TextEncoder().encode('WEBCRYPTO_GROUP_AES_256_GCM_SESSION_KEY');
 
   return window.crypto.subtle.deriveKey(
     {
@@ -355,9 +445,24 @@ async function deriveChannelMegolmSessionKey(channelId, cryptoEpoch, ecdhBundleF
 }
 
 /**
- * 3. Chiffrement de bout en bout (E2EE) d'une enveloppe de message côté client (Sealed Sender).
- * L'identité de l'émetteur (`senderMatricule`, `senderName`), la `classification` et le `messageKind`
- * sont chiffrés à l'intérieur de `ciphertext_payload` pour que la base SQL ne stocke que `"SEALED_E2EE"`.
+ * Applique un remplissage (padding) par blocs de 256 octets sur le payload JSON
+ * avant chiffrement AES-256-GCM afin de masquer la taille exacte des messages courts.
+ */
+function padPlaintextObjectTo256Bytes(plaintextObject) {
+  const clone = { ...plaintextObject };
+  const initialBytes = new TextEncoder().encode(JSON.stringify(clone)).byteLength;
+  const remainder = initialBytes % 256;
+  const padLen = remainder === 0 ? 32 : 256 - remainder;
+  clone._pad = 'X'.repeat(Math.max(8, padLen));
+  return new TextEncoder().encode(JSON.stringify(clone));
+}
+
+/**
+ * 3. Chiffrement de bout en bout (E2EE) d'une enveloppe de message côté client (Sealed Sender réel).
+ * - L'identité de l'émetteur (`senderMatricule`, `senderName`), la `classification`, `noForward`
+ *   et `antiScreenshot` sont scellés dans `ciphertext_payload`.
+ * - Aucun `sender_ephemeral_public_key` n'est envoyé en clair : la signature `authenticity_mac`
+ *   est vérifiée contre la clé publique d'annuaire de l'agent.
  */
 export async function encryptE2EEMessagePayload({
   channelId,
@@ -365,9 +470,9 @@ export async function encryptE2EEMessagePayload({
   plaintextObject,
   keystore,
 }) {
-  const sessionKey = await deriveChannelMegolmSessionKey(channelId, cryptoEpoch);
-  const iv = window.crypto.getRandomValues(new Uint8Array(12)); // Nonce 96 bits pour AES-256-GCM
-  const encodedPlaintext = new TextEncoder().encode(JSON.stringify(plaintextObject));
+  const sessionKey = await deriveChannelGroupSessionKey(channelId, cryptoEpoch);
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encodedPlaintext = padPlaintextObjectTo256Bytes(plaintextObject);
 
   const ciphertextBuffer = await window.crypto.subtle.encrypt(
     {
@@ -382,7 +487,6 @@ export async function encryptE2EEMessagePayload({
   const ciphertextB64 = bytesToBase64(ciphertextBuffer);
   const ivB64 = bytesToBase64(iv);
 
-  // Signature ECDSA-SHA256 de l'enveloppe chiffrée par la clé privée de l'agent émetteur
   const signingPrivateKey = await window.crypto.subtle.importKey(
     'jwk',
     keystore.signingPrivateJwk,
@@ -399,31 +503,49 @@ export async function encryptE2EEMessagePayload({
   );
 
   return {
-    e2ee_protocol: 'MATRIX_OLM_MEGOLM_X3DH_V2',
+    e2ee_protocol: 'WEBCRYPTO_ECDH_HKDF_AES256GCM_ECDSA',
     ciphertext_payload: ciphertextB64,
     nonce_or_iv: ivB64,
-    sender_ephemeral_public_key: JSON.stringify(keystore.signingPublicJwk),
     authenticity_mac: bytesToHex(signatureBuffer),
   };
 }
 
 /**
- * 4. Vérification cryptographique de la signature `ECDSA P-256` côté client ET déchiffrement E2EE
- * (Finding 3.3 de l'audit).
+ * 4. Déchiffrement E2EE ET vérification de la signature `ECDSA P-256` liée au matricule d'annuaire.
+ * L'émetteur revendiqué dans le payload déchiffré (`parsedContent.senderMatricule`) est recherché
+ * dans `activeMembers` (l'annuaire du canal), et `authenticity_mac` est vérifié contre
+ * `sender.e2ee_signing_public_key`. Ainsi, aucun membre ne peut usurper le matricule d'un autre !
  */
-export async function decryptE2EEMessagePayload(envelope) {
+export async function decryptE2EEMessagePayload(envelope, activeMembers = []) {
   try {
     const epoch = envelope.crypto_epoch || 1;
+    const sessionKey = await deriveChannelGroupSessionKey(envelope.channel_id, epoch);
+    const ivBytes = base64ToBytes(envelope.nonce_or_iv);
+    const ciphertextBytes = base64ToBytes(envelope.ciphertext_payload);
 
-    // Étape A : Vérification de la signature ECDSA P-256 (`authenticity_mac`) contre la clé publique de l'émetteur
+    const decryptedBuffer = await window.crypto.subtle.decrypt(
+      {
+        name: 'AES-GCM',
+        iv: ivBytes,
+        tagLength: 128,
+      },
+      sessionKey,
+      ciphertextBytes
+    );
+
+    const jsonString = new TextDecoder().decode(decryptedBuffer);
+    const parsedContent = JSON.parse(jsonString);
+    delete parsedContent._pad;
+
+    // Vérification stricte de la signature ECDSA P-256 contre la clé publique d'ANNUAIRE du matricule revendiqué
     let signatureVerified = false;
-    if (
-      envelope.sender_ephemeral_public_key &&
-      envelope.sender_ephemeral_public_key.trim().startsWith('{') &&
-      envelope.authenticity_mac
-    ) {
+    const claimedMatricule = parsedContent.senderMatricule;
+    const directorySender = (activeMembers || []).find((m) => m.matricule === claimedMatricule);
+    const signingPubJwkStr = directorySender?.e2ee_signing_public_key;
+
+    if (signingPubJwkStr && signingPubJwkStr.trim().startsWith('{') && envelope.authenticity_mac) {
       try {
-        const senderPubJwk = JSON.parse(envelope.sender_ephemeral_public_key);
+        const senderPubJwk = JSON.parse(signingPubJwkStr);
         const senderSigningPubKey = await window.crypto.subtle.importKey(
           'jwk',
           senderPubJwk,
@@ -445,23 +567,6 @@ export async function decryptE2EEMessagePayload(envelope) {
       }
     }
 
-    // Étape B : Déchiffrement AES-256-GCM (avec vérification du tag d'intégrité GCM 128 bits)
-    const sessionKey = await deriveChannelMegolmSessionKey(envelope.channel_id, epoch);
-    const ivBytes = base64ToBytes(envelope.nonce_or_iv);
-    const ciphertextBytes = base64ToBytes(envelope.ciphertext_payload);
-
-    const decryptedBuffer = await window.crypto.subtle.decrypt(
-      {
-        name: 'AES-GCM',
-        iv: ivBytes,
-        tagLength: 128,
-      },
-      sessionKey,
-      ciphertextBytes
-    );
-
-    const jsonString = new TextDecoder().decode(decryptedBuffer);
-    const parsedContent = JSON.parse(jsonString);
     return {
       decryptedOk: true,
       signatureVerified,
@@ -483,7 +588,7 @@ export async function decryptE2EEMessagePayload(envelope) {
  * 5. Chiffrement de bout en bout d'un fichier ou d'une note vocale avant upload vers `/api/blobs`.
  */
 export async function encryptBinaryAttachmentE2EE(dataUrlOrBase64, channelId, cryptoEpoch) {
-  const sessionKey = await deriveChannelMegolmSessionKey(channelId, cryptoEpoch);
+  const sessionKey = await deriveChannelGroupSessionKey(channelId, cryptoEpoch);
   const iv = window.crypto.getRandomValues(new Uint8Array(12));
   const rawBytes = new TextEncoder().encode(dataUrlOrBase64);
 
@@ -503,7 +608,7 @@ export async function encryptBinaryAttachmentE2EE(dataUrlOrBase64, channelId, cr
  * 6. Déchiffrement côté client d'un fichier ou d'une note vocale téléchargée depuis `/api/blobs/{id}`.
  */
 export async function decryptBinaryAttachmentE2EE(ciphertextB64, ivB64, channelId, cryptoEpoch) {
-  const sessionKey = await deriveChannelMegolmSessionKey(channelId, cryptoEpoch);
+  const sessionKey = await deriveChannelGroupSessionKey(channelId, cryptoEpoch);
   const ivBytes = base64ToBytes(ivB64);
   const cipherBytes = base64ToBytes(ciphertextB64);
 
@@ -517,7 +622,6 @@ export async function decryptBinaryAttachmentE2EE(ciphertextB64, ivB64, channelI
 
 /**
  * 7. Signature cryptographique d'un Accusé de Lecture à Valeur Probante (Instructions de Service).
- * L'agent signe avec sa clé privée ECDSA P-256 le condensat SHA-256 du message chiffré + son matricule.
  */
 export async function signProbativeReadReceipt({ messageId, ciphertextPayload, matricule, keystore }) {
   const payloadToHash = new TextEncoder().encode(
@@ -550,6 +654,7 @@ export async function signProbativeReadReceipt({ messageId, ciphertextPayload, m
  * 8. Effacement d'urgence ou révocation à distance (`REMOTE_WIPE` / Bouton d'Urgence).
  */
 export function wipeLocalCryptoKeystore() {
+  clearGroupSecrets();
   const keysToRemove = [];
   for (let i = 0; i < window.localStorage.length; i += 1) {
     const k = window.localStorage.key(i);

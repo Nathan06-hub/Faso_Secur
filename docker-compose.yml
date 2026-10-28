@@ -8,8 +8,10 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/faso_secur_sovereign.db}
-      - FASO_SECUR_JWT_SECRET=${FASO_SECUR_JWT_SECRET:-bf-dgtd-sovereign-jwt-secret-key-2026-hackathon226}
-      - FASO_SECUR_METADATA_PEPPER=${FASO_SECUR_METADATA_PEPPER:-bf-dgtd-metadata-minimization-pepper-2026}
+      # Si non définis dans un fichier .env externe, le serveur génère des secrets CSPRNG 256 bits au démarrage (zéro secret statique codé en dur)
+      - FASO_SECUR_JWT_SECRET=${FASO_SECUR_JWT_SECRET:-}
+      - FASO_SECUR_METADATA_PEPPER=${FASO_SECUR_METADATA_PEPPER:-}
+      - FASO_SECUR_TOTP_ENCRYPTION_KEY=${FASO_SECUR_TOTP_ENCRYPTION_KEY:-}
       - FASO_SECUR_DEMO_MODE=${FASO_SECUR_DEMO_MODE:-true}
       - FASO_SECUR_CORS_ORIGINS=${FASO_SECUR_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://msg.gouv.bf}
     volumes:

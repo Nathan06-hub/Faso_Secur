@@ -3,6 +3,7 @@ Serveur Souverain Zero-Knowledge & Sealed Sender FASO-SÉCUR — API FastAPI & W
 Développé pour le Sprint Technique Pré-Hackathon 226 (MTDPCE / DGTD — Burkina Faso).
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -16,10 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+import auth
 from auth import (
-    DEMO_MODE_ENABLED,
     build_otpauth_uri,
+    compute_key_safety_number,
     create_access_token,
+    decrypt_totp_secret_at_rest,
+    encrypt_totp_secret_at_rest,
     generate_current_totp_code,
     generate_totp_secret,
     get_current_agent,
@@ -62,14 +66,13 @@ app = FastAPI(
     title="FASO-SÉCUR — Serveur Souverain Zero-Knowledge (MTDPCE / DGTD)",
     description=(
         "Messagerie instantanée souveraine de l'administration publique du Burkina Faso. "
-        "Chiffrement de bout en bout (Matrix Olm/Megolm & Signal X3DH ECDH P-256), "
-        "Sealed Sender, Authentification Forte 2FA TOTP (RFC 6238), Révocation Immédiate."
+        "Chiffrement de bout en bout (WebCrypto ECDH P-256 + HKDF-SHA256 + AES-256-GCM + ECDSA P-256), "
+        "Sealed Sender, Authentification Forte 2FA TOTP (RFC 6238 chiffré Fernet), Révocation Immédiate."
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
-# Origines CORS restreintes aux domaines souverains autorisés (configurable par variable d'env)
 ALLOWED_CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -116,18 +119,14 @@ class PublishPublicKeysRequest(BaseModel):
 class PublishGroupSessionBundleRequest(BaseModel):
     crypto_epoch: int
     wrapped_keys_by_matricule: Dict[str, Any]
+    initial: bool = False
 
 
 class SendEncryptedMessageRequest(BaseModel):
-    e2ee_protocol: str = Field(default="MATRIX_OLM_MEGOLM_X3DH_V2")
+    e2ee_protocol: str = Field(default="WEBCRYPTO_ECDH_HKDF_AES256GCM_ECDSA")
     ciphertext_payload: str = Field(..., min_length=16, description="Payload chiffré E2EE côté client (Sealed Sender)")
     nonce_or_iv: str = Field(..., min_length=8)
-    sender_ephemeral_public_key: str = Field(..., min_length=8)
-    authenticity_mac: str = Field(..., min_length=16)
-    message_kind: str = Field(default="SEALED_E2EE")
-    classification: str = Field(default="SEALED_E2EE")
-    no_forward: bool = False
-    anti_screenshot: bool = False
+    authenticity_mac: str = Field(..., min_length=16, description="Signature ECDSA P-256 vérifiée contre l'annuaire")
     requires_probative_receipt: bool = False
     expires_in_seconds: Optional[int] = None
     encrypted_blob_id: Optional[str] = None
@@ -178,9 +177,9 @@ def health_check():
         "status": "OPERATIONAL",
         "sovereign_hosting": True,
         "external_dependencies": "NONE (Zero Third-Party Services)",
-        "e2ee_enforcement": "STRICT_CLIENT_SIDE_X3DH_MEGOLM_SEALED_SENDER",
-        "two_factor_auth": "RFC_6238_TOTP_MANDATORY",
-        "demo_mode": DEMO_MODE_ENABLED,
+        "e2ee_enforcement": "WEBCRYPTO_ECDH_HKDF_AES256GCM_ECDSA_SEALED_SENDER",
+        "two_factor_auth": "RFC_6238_TOTP_FERNET_ENCRYPTED_AT_REST",
+        "demo_mode": auth.DEMO_MODE_ENABLED,
     }
 
 
@@ -188,12 +187,12 @@ def health_check():
 def list_fictional_demo_accounts(db: Session = Depends(get_db)):
     """
     Retourne la liste des comptes fictifs de démonstration uniquement lorsque
-    `FASO_SECUR_DEMO_MODE=true` (activé pour l'évaluation du jury, désactivable en production).
+    `FASO_SECUR_DEMO_MODE=true`. Ne retourne jamais le secret TOTP Base32 brut.
     """
-    if not DEMO_MODE_ENABLED:
+    if not auth.DEMO_MODE_ENABLED:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Endpoint de démonstration désactivé en mode production souveraine (FASO_SECUR_DEMO_MODE=false).",
+            detail="Endpoint de démonstration désactivé hors mode démo (FASO_SECUR_DEMO_MODE=false).",
         )
 
     agents = db.query(EnrolledAgent).order_by(EnrolledAgent.id.asc()).all()
@@ -213,27 +212,18 @@ def list_fictional_demo_accounts(db: Session = Depends(get_db)):
                 "is_revoked": ag.is_revoked,
                 "revocation_reason": ag.revocation_reason,
                 "demo_password": demo_passwords.get(ag.matricule, "FasoSecur!2026"),
-                "current_totp_code": generate_current_totp_code(ag.totp_secret),
-                "otpauth_uri": build_otpauth_uri(ag.matricule, ag.ministry, ag.totp_secret),
+                "current_totp_code": generate_current_totp_code(ag.totp_secret_encrypted),
             }
         )
     return {"demo_accounts": result}
 
 
 # ============================================================================
-# 2. AUTHENTIFICATION VÉRIFIÉE (ENRÔLEMENT + 2FA TOTP + ANTI-BRUTE-FORCE)
+# 2. AUTHENTIFICATION VÉRIFIÉE (ENRÔLEMENT + 2FA TOTP FERNET + ANTI-BRUTE-FORCE)
 # ============================================================================
 
 @app.post("/api/auth/login")
 def login_enrolled_agent(req: LoginRequest, db: Session = Depends(get_db)):
-    """
-    Authentifie un agent public en vérifiant :
-    0. Qu'il n'a pas dépassé le seuil anti-brute-force (5 tentatives / 5 min)
-    1. Qu'il figure bien dans le registre d'enrôlement souverain (sinon rejet 403 Intrus)
-    2. Qu'il n'est pas révoqué (sinon rejet 403 Révocation)
-    3. Son mot de passe (bcrypt)
-    4. Son second facteur 2FA TOTP (RFC 6238 via PyCA cryptography)
-    """
     matricule_clean = req.matricule.strip().upper()
     login_rate_limiter.check_allowed(matricule_clean)
 
@@ -289,7 +279,7 @@ def login_enrolled_agent(req: LoginRequest, db: Session = Depends(get_db)):
             detail="Identifiants invalides (mot de passe incorrect).",
         )
 
-    if not verify_totp_code(agent.totp_secret, req.totp_code):
+    if not verify_totp_code(agent.totp_secret_encrypted, req.totp_code):
         login_rate_limiter.record_failure(matricule_clean)
         db.add(
             SecurityAuditLog(
@@ -332,6 +322,7 @@ def login_enrolled_agent(req: LoginRequest, db: Session = Depends(get_db)):
             "role": agent.role,
             "preferred_lang": agent.preferred_lang,
             "e2ee_key_epoch": agent.e2ee_key_epoch,
+            "e2ee_safety_number": agent.e2ee_safety_number,
         },
     }
 
@@ -339,9 +330,6 @@ def login_enrolled_agent(req: LoginRequest, db: Session = Depends(get_db)):
 @app.post("/api/auth/register")
 @app.post("/api/auth/intruder-attempt")
 def reject_public_registration_or_intruder(req: IntruderAttemptRequest, db: Session = Depends(get_db)):
-    """
-    Épreuve du jury « Intrus : un compte non enrôlé tente de rejoindre la messagerie ou un groupe ; il doit être rejeté ».
-    """
     db.add(
         SecurityAuditLog(
             event_type="INTRUDER_REJECTED",
@@ -365,7 +353,7 @@ def reject_public_registration_or_intruder(req: IntruderAttemptRequest, db: Sess
 
 
 # ============================================================================
-# 3. ANNUAIRE OFFICIEL PAR MINISTÈRE & TROUSSEAU DE CLÉS PUBLIQUES E2EE (X3DH)
+# 3. ANNUAIRE OFFICIEL PAR MINISTÈRE & TROUSSEAU DE CLÉS PUBLIQUES E2EE
 # ============================================================================
 
 @app.post("/api/e2ee/keys")
@@ -376,31 +364,55 @@ def publish_agent_public_key_bundle(
 ):
     """
     Enregistre uniquement les clés PUBLIQUES E2EE de l'agent (IdentityKey ECDH, SigningKey ECDSA, SignedPreKey).
-    Vérifie cryptographiquement la signature ECDSA de la pré-clé signée (`signed_prekey_signature`) !
+    Vérification OBLIGATOIRE de la validité des JWK P-256 et de la signature ECDSA (`signed_prekey_signature`) !
     """
-    if req.signing_public_key.startswith("{") and req.signed_prekey_public.startswith("{"):
-        prekey_bytes = req.signed_prekey_public.encode("utf-8")
-        is_valid_prekey_sig = verify_ecdsa_p256_jwk_signature(
-            public_jwk_json=req.signing_public_key,
-            message_bytes=prekey_bytes,
-            signature_hex=req.signed_prekey_signature,
-        )
-        if not is_valid_prekey_sig:
+    for field_name, jwk_str in (
+        ("identity_public_key", req.identity_public_key),
+        ("signing_public_key", req.signing_public_key),
+        ("signed_prekey_public", req.signed_prekey_public),
+    ):
+        try:
+            parsed = json.loads(jwk_str)
+            if not isinstance(parsed, dict) or parsed.get("crv") != "P-256" or "x" not in parsed or "y" not in parsed:
+                raise ValueError("Not a P-256 JWK")
+            if "d" in parsed:
+                raise ValueError("Private key forbidden on server")
+        except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Signature ECDSA P-256 de la pré-clé publique (SignedPreKey) invalide.",
-            )
+                detail=f"Clé publique '{field_name}' invalide : JWK P-256 public requis.",
+            ) from exc
+
+    prekey_bytes = req.signed_prekey_public.encode("utf-8")
+    is_valid_prekey_sig = verify_ecdsa_p256_jwk_signature(
+        public_jwk_json=req.signing_public_key,
+        message_bytes=prekey_bytes,
+        signature_hex=req.signed_prekey_signature,
+    )
+    if not is_valid_prekey_sig:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Signature ECDSA P-256 de la pré-clé publique (SignedPreKey) invalide.",
+        )
+
+    safety_number = compute_key_safety_number(
+        current_agent.matricule,
+        req.identity_public_key,
+        req.signing_public_key,
+    )
 
     current_agent.e2ee_identity_public_key = req.identity_public_key
     current_agent.e2ee_signing_public_key = req.signing_public_key
     current_agent.e2ee_signed_prekey_public = req.signed_prekey_public
     current_agent.e2ee_signed_prekey_signature = req.signed_prekey_signature
+    current_agent.e2ee_safety_number = safety_number
     current_agent.e2ee_one_time_prekeys_json = req.one_time_prekeys_json
     db.commit()
     return {
         "status": "PUBLIC_KEYS_PUBLISHED_AND_VERIFIED",
         "matricule": current_agent.matricule,
         "e2ee_key_epoch": current_agent.e2ee_key_epoch,
+        "e2ee_safety_number": safety_number,
     }
 
 
@@ -438,6 +450,7 @@ def get_official_ministry_directory(
                 "signing_public_key": ag.e2ee_signing_public_key,
                 "signed_prekey_public": ag.e2ee_signed_prekey_public,
                 "signed_prekey_signature": ag.e2ee_signed_prekey_signature,
+                "safety_number": ag.e2ee_safety_number,
                 "key_epoch": ag.e2ee_key_epoch,
             },
         }
@@ -451,7 +464,7 @@ def get_official_ministry_directory(
 
 
 # ============================================================================
-# 4. CANAUX INSTITUTIONNELS, ÉCHANGE DE CLÉS X3DH/ECDH & MESSAGERIE SEALED SENDER
+# 4. CANAUX INSTITUTIONNELS, ÉCHANGE DE CLÉS ECDH & MESSAGERIE SEALED SENDER
 # ============================================================================
 
 @app.get("/api/channels")
@@ -502,6 +515,7 @@ def list_agent_channels(
                         "e2ee_identity_public_key": m.e2ee_identity_public_key,
                         "e2ee_signing_public_key": m.e2ee_signing_public_key,
                         "e2ee_signed_prekey_public": m.e2ee_signed_prekey_public,
+                        "e2ee_safety_number": m.e2ee_safety_number,
                     }
                     for m in members
                 ],
@@ -517,11 +531,6 @@ def publish_ecdh_wrapped_group_session_keys(
     current_agent: EnrolledAgent = Depends(get_current_agent),
     db: Session = Depends(get_db),
 ):
-    """
-    Enregistre les enveloppes de clé de session Megolm chiffrées individuellement par accord
-    Diffie-Hellman `ECDH P-256` (X3DH) pour chaque membre actif du canal.
-    Le serveur ne possède aucune clé privée ECDH et ne peut JAMAIS déchiffrer ces enveloppes.
-    """
     membership = (
         db.query(ChannelMember)
         .filter(ChannelMember.channel_id == channel_id, ChannelMember.agent_id == current_agent.id)
@@ -534,6 +543,35 @@ def publish_ecdh_wrapped_group_session_keys(
     if not channel:
         raise HTTPException(status_code=404, detail="Canal introuvable.")
 
+    if req.crypto_epoch != channel.crypto_epoch:
+        raise HTTPException(
+            status_code=409,
+            detail="Époque cryptographique obsolète ou inconnue : enveloppes refusées.",
+        )
+
+    active_matricules = {
+        row[0]
+        for row in db.query(EnrolledAgent.matricule)
+        .join(ChannelMember, ChannelMember.agent_id == EnrolledAgent.id)
+        .filter(ChannelMember.channel_id == channel_id, EnrolledAgent.is_revoked == False)  # noqa: E712
+        .all()
+    }
+    incoming = {}
+    for matricule, bundle in req.wrapped_keys_by_matricule.items():
+        if (
+            matricule in active_matricules
+            and isinstance(bundle, dict)
+            and all(isinstance(bundle.get(k), str) for k in ("senderMatricule", "ivB64", "wrappedKeyB64"))
+            and bundle["senderMatricule"] == current_agent.matricule
+        ):
+            incoming[matricule] = {
+                "senderMatricule": bundle["senderMatricule"],
+                "ivB64": bundle["ivB64"],
+                "wrappedKeyB64": bundle["wrappedKeyB64"],
+            }
+    if not incoming:
+        raise HTTPException(status_code=422, detail="Aucune enveloppe valide pour des membres actifs.")
+
     try:
         bundles = json.loads(channel.encrypted_group_session_bundles or "{}")
     except Exception:
@@ -541,7 +579,17 @@ def publish_ecdh_wrapped_group_session_keys(
 
     epoch_key = str(req.crypto_epoch)
     existing_epoch_bundles = bundles.get(epoch_key, {})
-    existing_epoch_bundles.update(req.wrapped_keys_by_matricule)
+
+    if req.initial:
+        if existing_epoch_bundles:
+            raise HTTPException(status_code=409, detail="Un secret de groupe existe déjà pour cette époque.")
+        existing_epoch_bundles = incoming
+    else:
+        if current_agent.matricule not in existing_epoch_bundles:
+            raise HTTPException(status_code=403, detail="Vous ne détenez pas le secret de cette époque.")
+        for matricule, bundle in incoming.items():
+            existing_epoch_bundles.setdefault(matricule, bundle)
+
     bundles[epoch_key] = existing_epoch_bundles
     channel.encrypted_group_session_bundles = json.dumps(bundles)
     db.commit()
@@ -590,11 +638,6 @@ def get_channel_encrypted_messages(
     current_agent: EnrolledAgent = Depends(get_current_agent),
     db: Session = Depends(get_db),
 ):
-    """
-    Récupère les enveloppes chiffrées E2EE d'un canal (Sealed Sender).
-    Le serveur ne stocke ni `sender_id` ni `created_at` milliseconde : c'est le client
-    destinataire qui déchiffre l'identité de l'émetteur et la classification depuis `ciphertext_payload`.
-    """
     membership = (
         db.query(ChannelMember)
         .filter(
@@ -645,13 +688,10 @@ def get_channel_encrypted_messages(
                 "crypto_epoch": msg.crypto_epoch,
                 "ciphertext_payload": msg.ciphertext_payload,
                 "nonce_or_iv": msg.nonce_or_iv,
-                "sender_ephemeral_public_key": msg.sender_ephemeral_public_key,
                 "authenticity_mac": msg.authenticity_mac,
                 "ecdsa_verified_by_server": msg.ecdsa_verified_by_server,
                 "message_kind": msg.message_kind,
                 "classification": msg.classification,
-                "no_forward": msg.no_forward,
-                "anti_screenshot": msg.anti_screenshot,
                 "requires_probative_receipt": msg.requires_probative_receipt,
                 "expires_at": msg.expires_at.isoformat() + "Z" if msg.expires_at else None,
                 "encrypted_blob_id": msg.encrypted_blob_id,
@@ -682,10 +722,12 @@ async def post_encrypted_message(
     db: Session = Depends(get_db),
 ):
     """
-    Reçoit, vérifie cryptographiquement la signature ECDSA P-256 de l'enveloppe, et stocke
-    UNIQUEMENT une enveloppe chiffrée de bout en bout avec Sealed Sender.
-    - En base SQL, `classification` et `message_kind` sont masqués sous `"SEALED_E2EE"`.
-    - Aucun `sender_id` en clair ni `created_at` milliseconde n'est enregistré.
+    Reçoit et stocke UNIQUEMENT une enveloppe chiffrée de bout en bout avec Sealed Sender.
+    Correctif prioritaire de l'audit :
+    1. La vérification de la signature ECDSA P-256 (`authenticity_mac`) est OBLIGATOIRE.
+    2. Elle s'effectue EXCLUSIVEMENT contre `current_agent.e2ee_signing_public_key` (la clé de l'annuaire),
+       et JAMAIS contre une clé non vérifiée fournie dans la requête.
+    3. Aucun `sender_ephemeral_public_key`, `no_forward` ni `anti_screenshot` n'est stocké en clair.
     """
     if req.plaintext is not None:
         raise HTTPException(
@@ -711,41 +753,39 @@ async def post_encrypted_message(
     if not channel:
         raise HTTPException(status_code=404, detail="Canal introuvable.")
 
-    # Vérification cryptographique côté serveur de la signature ECDSA P-256 si clé JWK P-256 fournie
-    ecdsa_verified = True
-    pub_key_candidate = req.sender_ephemeral_public_key or current_agent.e2ee_signing_public_key
-    if pub_key_candidate and pub_key_candidate.strip().startswith("{"):
-        mac_input = f"{channel_id}:{channel.crypto_epoch}:{req.nonce_or_iv}:{req.ciphertext_payload}".encode("utf-8")
-        ecdsa_verified = verify_ecdsa_p256_jwk_signature(
-            public_jwk_json=pub_key_candidate,
-            message_bytes=mac_input,
-            signature_hex=req.authenticity_mac,
+    if not current_agent.e2ee_signing_public_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Clé publique de signature absente de l'annuaire : publiez d'abord vos clés via /api/e2ee/keys.",
         )
-        if not ecdsa_verified:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="REJET CRYPTOGRAPHIQUE : Signature ECDSA P-256 (`authenticity_mac`) invalide pour cette enveloppe E2EE.",
-            )
+
+    mac_input = f"{channel_id}:{channel.crypto_epoch}:{req.nonce_or_iv}:{req.ciphertext_payload}".encode("utf-8")
+    ecdsa_verified = verify_ecdsa_p256_jwk_signature(
+        public_jwk_json=current_agent.e2ee_signing_public_key,
+        message_bytes=mac_input,
+        signature_hex=req.authenticity_mac,
+    )
+    if not ecdsa_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="REJET CRYPTOGRAPHIQUE : Signature ECDSA P-256 (`authenticity_mac`) invalide contre votre clé d'annuaire.",
+        )
 
     expires_at = None
     if req.expires_in_seconds and req.expires_in_seconds > 0:
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=req.expires_in_seconds)).replace(tzinfo=None)
 
-    # Minimisation stricte des métadonnées en BDD : on scelle `message_kind` et `classification`
     msg = EncryptedMessage(
         channel_id=channel_id,
         sender_pseudonym_hash=pseudonymize_identifier(current_agent.matricule),
-        e2ee_protocol=req.e2ee_protocol,
+        e2ee_protocol="WEBCRYPTO_ECDH_HKDF_AES256GCM_ECDSA",
         crypto_epoch=channel.crypto_epoch,
         ciphertext_payload=req.ciphertext_payload,
         nonce_or_iv=req.nonce_or_iv,
-        sender_ephemeral_public_key=req.sender_ephemeral_public_key,
         authenticity_mac=req.authenticity_mac,
-        ecdsa_verified_by_server=ecdsa_verified,
+        ecdsa_verified_by_server=True,
         message_kind="SEALED_E2EE",
         classification="SEALED_E2EE",
-        no_forward=req.no_forward,
-        anti_screenshot=req.anti_screenshot,
         requires_probative_receipt=req.requires_probative_receipt,
         expires_at=expires_at,
         encrypted_blob_id=req.encrypted_blob_id,
@@ -776,13 +816,10 @@ async def post_encrypted_message(
             "crypto_epoch": msg.crypto_epoch,
             "ciphertext_payload": msg.ciphertext_payload,
             "nonce_or_iv": msg.nonce_or_iv,
-            "sender_ephemeral_public_key": msg.sender_ephemeral_public_key,
             "authenticity_mac": msg.authenticity_mac,
             "ecdsa_verified_by_server": msg.ecdsa_verified_by_server,
             "message_kind": msg.message_kind,
             "classification": msg.classification,
-            "no_forward": msg.no_forward,
-            "anti_screenshot": msg.anti_screenshot,
             "requires_probative_receipt": msg.requires_probative_receipt,
             "expires_at": msg.expires_at.isoformat() + "Z" if msg.expires_at else None,
             "encrypted_blob_id": msg.encrypted_blob_id,
@@ -873,7 +910,7 @@ def download_encrypted_attachment_blob(
 
 
 # ============================================================================
-# 6. ACCUSÉ DE LECTURE À VALEUR PROBANTE AVEC VÉRIFICATION ECDSA P-256
+# 6. ACCUSÉ DE LECTURE À VALEUR PROBANTE AVEC VÉRIFICATION ECDSA P-256 STRICTE
 # ============================================================================
 
 @app.post("/api/messages/{message_id}/probative-receipt")
@@ -883,37 +920,45 @@ async def submit_probative_read_receipt(
     current_agent: EnrolledAgent = Depends(get_current_agent),
     db: Session = Depends(get_db),
 ):
-    """
-    Enregistre un accusé de réception signé cryptographiquement par l'agent destinataire.
-    Vérifie d'abord que le condensat SHA-256 correspond bien au message chiffré ET vérifie
-    la signature `ECDSA P-256` contre la clé publique enregistrée de l'agent lecteur.
-    """
     msg = db.query(EncryptedMessage).filter(EncryptedMessage.id == message_id).first()
     if not msg:
         raise HTTPException(status_code=404, detail="Message introuvable.")
+
+    membership = (
+        db.query(ChannelMember)
+        .filter(ChannelMember.channel_id == msg.channel_id, ChannelMember.agent_id == current_agent.id)
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=403, detail="Accès interdit à ce canal.")
+
+    if not current_agent.e2ee_signing_public_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Clé publique de signature absente de l'annuaire : publiez d'abord vos clés via /api/e2ee/keys.",
+        )
 
     expected_preimage = (
         f"PROBATIVE_RECEIPT::MSG={message_id}::AGENT={current_agent.matricule}::CIPHER={msg.ciphertext_payload}"
     ).encode("utf-8")
     expected_hash_hex = hashlib.sha256(expected_preimage).hexdigest()
 
-    ecdsa_verified = True
-    if current_agent.e2ee_signing_public_key and current_agent.e2ee_signing_public_key.strip().startswith("{"):
-        if req.signed_payload_hash != expected_hash_hex:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Condensat SHA-256 de l'accusé de lecture invalide.",
-            )
-        ecdsa_verified = verify_ecdsa_p256_jwk_signature(
-            public_jwk_json=current_agent.e2ee_signing_public_key,
-            message_bytes=bytes.fromhex(expected_hash_hex),
-            signature_hex=req.signature_hex,
+    if req.signed_payload_hash != expected_hash_hex:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Condensat SHA-256 de l'accusé de lecture invalide.",
         )
-        if not ecdsa_verified:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Signature ECDSA P-256 de l'accusé de lecture probant invalide.",
-            )
+
+    ecdsa_verified = verify_ecdsa_p256_jwk_signature(
+        public_jwk_json=current_agent.e2ee_signing_public_key,
+        message_bytes=bytes.fromhex(expected_hash_hex),
+        signature_hex=req.signature_hex,
+    )
+    if not ecdsa_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Signature ECDSA P-256 de l'accusé de lecture probant invalide contre votre clé d'annuaire.",
+        )
 
     existing = (
         db.query(ProbativeReadReceipt)
@@ -942,7 +987,7 @@ async def submit_probative_read_receipt(
         agent_full_name=current_agent.full_name,
         signature_hex=req.signature_hex,
         signed_payload_hash=req.signed_payload_hash,
-        ecdsa_verified=ecdsa_verified,
+        ecdsa_verified=True,
     )
     db.add(receipt)
     db.commit()
@@ -987,7 +1032,8 @@ def enrol_new_public_agent(
     if db.query(EnrolledAgent).filter(EnrolledAgent.matricule == matricule_clean).first():
         raise HTTPException(status_code=400, detail="Ce matricule est déjà enrôlé.")
 
-    totp_secret = generate_totp_secret()
+    plain_totp_secret = generate_totp_secret()
+    encrypted_totp = encrypt_totp_secret_at_rest(plain_totp_secret)
     new_agent = EnrolledAgent(
         matricule=matricule_clean,
         full_name=req.full_name,
@@ -997,7 +1043,7 @@ def enrol_new_public_agent(
         role=req.role,
         preferred_lang=req.preferred_lang,
         password_hash=hash_password(req.temporary_password),
-        totp_secret=totp_secret,
+        totp_secret_encrypted=encrypted_totp,
         totp_enabled=True,
         is_enrolled_activated=True,
         is_revoked=False,
@@ -1015,7 +1061,7 @@ def enrol_new_public_agent(
             event_type="AGENT_ENROLLED",
             severity="INFO",
             actor_pseudonym=pseudonymize_identifier(admin_agent.matricule),
-            description=f"Enrôlement officiel de l'agent {matricule_clean} ({req.ministry}) avec 2FA TOTP activé.",
+            description=f"Enrôlement officiel de l'agent {matricule_clean} ({req.ministry}) avec 2FA TOTP chiffré Fernet.",
             timestamp_bucket=get_timestamp_bucket(),
         )
     )
@@ -1025,9 +1071,9 @@ def enrol_new_public_agent(
         "id": new_agent.id,
         "matricule": new_agent.matricule,
         "full_name": new_agent.full_name,
-        "totp_secret": totp_secret,
-        "current_totp_code": generate_current_totp_code(totp_secret),
-        "otpauth_uri": build_otpauth_uri(new_agent.matricule, new_agent.ministry, totp_secret),
+        "totp_secret_provisioning_once": plain_totp_secret,
+        "current_totp_code": generate_current_totp_code(encrypted_totp),
+        "otpauth_uri": build_otpauth_uri(new_agent.matricule, new_agent.ministry, plain_totp_secret),
     }
 
 
@@ -1042,17 +1088,20 @@ async def revoke_agent_immediately(
     if not target:
         raise HTTPException(status_code=404, detail="Agent introuvable.")
 
+    memberships = db.query(ChannelMember).filter(ChannelMember.agent_id == target.id).all()
+    affected_channel_ids = [m.channel_id for m in memberships]
+
     target.is_revoked = True
     target.revoked_at = datetime.now(timezone.utc).replace(tzinfo=None)
     target.revocation_reason = req.reason
+    target.revoked_channel_ids_json = json.dumps(affected_channel_ids)
     target.token_version += 1
     target.e2ee_identity_public_key = None
     target.e2ee_signing_public_key = None
     target.e2ee_signed_prekey_public = None
+    target.e2ee_signed_prekey_signature = None
+    target.e2ee_safety_number = None
     target.e2ee_one_time_prekeys_json = None
-
-    memberships = db.query(ChannelMember).filter(ChannelMember.agent_id == target.id).all()
-    affected_channel_ids = [m.channel_id for m in memberships]
 
     for m in memberships:
         db.delete(m)
@@ -1109,9 +1158,24 @@ def reinstate_revoked_agent_for_demo(
     admin_agent: EnrolledAgent = Depends(require_admin_role),
     db: Session = Depends(get_db),
 ):
+    """
+    Réhabilite un compte fictif après test de révocation uniquement si `FASO_SECUR_DEMO_MODE=true`,
+    et uniquement dans les canaux auxquels l'agent appartenait initialement (`revoked_channel_ids_json`).
+    """
+    if not auth.DEMO_MODE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Réhabilitation rapide de démonstration désactivée hors mode démo (FASO_SECUR_DEMO_MODE=false).",
+        )
+
     target = db.query(EnrolledAgent).filter(EnrolledAgent.id == agent_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="Agent introuvable.")
+
+    try:
+        original_channel_ids = json.loads(target.revoked_channel_ids_json or "[]")
+    except Exception:
+        original_channel_ids = []
 
     target.is_revoked = False
     target.revoked_at = None
@@ -1119,8 +1183,12 @@ def reinstate_revoked_agent_for_demo(
     target.token_version += 1
     target.e2ee_key_epoch += 1
 
-    all_channels = db.query(Channel).all()
-    for ch in all_channels:
+    if original_channel_ids:
+        channels_to_restore = db.query(Channel).filter(Channel.id.in_(original_channel_ids)).all()
+    else:
+        channels_to_restore = db.query(Channel).filter(Channel.ministry_scope == "TOUS").all()
+
+    for ch in channels_to_restore:
         exists = (
             db.query(ChannelMember)
             .filter(ChannelMember.channel_id == ch.id, ChannelMember.agent_id == target.id)
@@ -1134,39 +1202,65 @@ def reinstate_revoked_agent_for_demo(
             event_type="AGENT_REINSTATED_DEMO",
             severity="INFO",
             actor_pseudonym=pseudonymize_identifier(admin_agent.matricule),
-            description=f"Réhabilitation de démonstration de l'agent {target.matricule} avec nouvelle époque de clés.",
+            description=f"Réhabilitation de démonstration de l'agent {target.matricule} dans ses {len(channels_to_restore)} canaux d'origine.",
             timestamp_bucket=get_timestamp_bucket(),
         )
     )
     db.commit()
-    return {"status": "REINSTATED", "matricule": target.matricule}
+    return {"status": "REINSTATED", "matricule": target.matricule, "restored_channels": [c.id for c in channels_to_restore]}
 
 
 # ============================================================================
-# 8. CONSOLE D'INSPECTION DU JURY (« LE SERVEUR NE LIT RIEN »)
+# 8. CONSOLE D'INSPECTION DU JURY (« LE SERVEUR NE LIT RIEN » — CALCUL DYNAMIQUE)
 # ============================================================================
+
+def _is_valid_base64_ciphertext(val: str) -> bool:
+    if not val or len(val) < 16:
+        return False
+    try:
+        decoded = base64.b64decode(val, validate=True)
+        return len(decoded) >= 12
+    except Exception:
+        return False
+
 
 @app.get("/api/jury/server-inspection")
 def inspect_raw_server_database_and_network(
-    current_agent: EnrolledAgent = Depends(get_current_agent),
+    admin_agent: EnrolledAgent = Depends(require_admin_role),
     db: Session = Depends(get_db),
 ):
     """
     Épreuve en direct du jury :
     « Le serveur ne lit rien : inspection de la base de données et du trafic réseau ;
     aucun message ni fichier ne doit apparaître en clair ».
+    - Strictement réservé aux rôles d'administration/audit (`require_admin_role`).
+    - Filtre les messages aux seuls canaux dont l'administrateur/auditeur est membre.
+    - Calcule dynamiquement les indicateurs de conformité sur le schéma SQL et les lignes réelles.
     """
+    member_channel_ids = [
+        r[0]
+        for r in db.query(ChannelMember.channel_id)
+        .filter(ChannelMember.agent_id == admin_agent.id)
+        .all()
+    ]
+
     raw_messages = (
         db.query(EncryptedMessage)
+        .filter(EncryptedMessage.channel_id.in_(member_channel_ids))
         .order_by(EncryptedMessage.id.desc())
         .limit(25)
         .all()
+        if member_channel_ids
+        else []
     )
     raw_blobs = (
         db.query(EncryptedAttachmentBlob)
+        .filter(EncryptedAttachmentBlob.channel_id.in_(member_channel_ids))
         .order_by(EncryptedAttachmentBlob.blob_id.desc())
         .limit(15)
         .all()
+        if member_channel_ids
+        else []
     )
     audit_logs = (
         db.query(SecurityAuditLog)
@@ -1175,15 +1269,31 @@ def inspect_raw_server_database_and_network(
         .all()
     )
 
+    # Calcul dynamique (non auto-certifié en dur) sur le schéma SQLAlchemy et les données en base
+    forbidden_cleartext_cols = {"plaintext", "body", "text", "content", "sender_id", "sender_matricule", "sender_ephemeral_public_key", "no_forward", "anti_screenshot"}
+    actual_msg_cols = {c.name for c in EncryptedMessage.__table__.columns}
+    detected_plaintext_cols = sorted(actual_msg_cols.intersection(forbidden_cleartext_cols))
+
+    all_agents = db.query(EnrolledAgent).all()
+    all_totp_encrypted = all(
+        ag.totp_secret_encrypted and ag.totp_secret_encrypted.startswith("gAAAAA")
+        for ag in all_agents
+    )
+    all_msgs_encrypted = all(_is_valid_base64_ciphertext(m.ciphertext_payload) for m in raw_messages)
+    all_ecdsa_verified = all(bool(m.ecdsa_verified_by_server) for m in raw_messages)
+
     return {
         "zero_knowledge_verification": {
-            "plaintext_columns_in_db": 0,
-            "sealed_sender_active": True,
-            "ecdsa_signature_verification_active": True,
-            "all_payloads_encrypted": True,
+            "plaintext_columns_in_db": len(detected_plaintext_cols),
+            "inspected_columns_encrypted_messages": sorted(actual_msg_cols),
+            "all_totp_secrets_fernet_encrypted_at_rest": all_totp_encrypted,
+            "sealed_sender_active": "sender_id" not in actual_msg_cols and "sender_ephemeral_public_key" not in actual_msg_cols,
+            "ecdsa_signature_verification_active": all_ecdsa_verified,
+            "all_payloads_encrypted": all_msgs_encrypted,
             "metadata_minimization": {
-                "sender_pseudonymization": "HMAC-SHA256 (aucun sender_id en clair dans encrypted_messages)",
-                "classification_and_kind_in_db": "SEALED_E2EE (chiffrés dans ciphertext_payload)",
+                "sender_pseudonymization": "HMAC-SHA256 (aucun sender_id ni sender_ephemeral_public_key en clair)",
+                "classification_and_flags_in_db": "SEALED_E2EE (no_forward, anti_screenshot et classification chiffrés dans ciphertext_payload)",
+                "message_padding": "Blocs de 256 octets avant chiffrement AES-256-GCM",
                 "timestamp_granularity": "Arrondi par tranche de 5 minutes (aucun created_at milliseconde)",
                 "attachment_padding": "Blocs de 4096 octets (masquage de la taille exacte)",
             },
