@@ -14,3 +14,109 @@
     display: none !important;
   }
 }
+
+/* Palette institutionnelle : surfaces claires, vert souverain et or discret. */
+@layer utilities {
+  [class~="bg-slate-950"], [class*="bg-slate-950/"] {
+    background-color: #f3f6f3 !important;
+  }
+
+  [class~="bg-slate-900"], [class*="bg-slate-900/"] {
+    background-color: #ffffff !important;
+  }
+
+  [class~="bg-slate-800"], [class*="bg-slate-800/"] {
+    background-color: #e9efea !important;
+  }
+
+  [class~="hover:bg-slate-700"]:hover {
+    background-color: #dce6de !important;
+  }
+
+  [class~="bg-emerald-950"], [class*="bg-emerald-950/"] {
+    background-color: #eaf4ed !important;
+  }
+
+  [class~="bg-emerald-900"], [class*="bg-emerald-900/"] {
+    background-color: #dceee2 !important;
+  }
+
+  [class~="bg-emerald-600"] {
+    background-color: #08743f !important;
+  }
+
+  [class~="hover:bg-emerald-500"]:hover {
+    background-color: #0a8448 !important;
+  }
+
+  [class~="bg-amber-950"], [class*="bg-amber-950/"] {
+    background-color: #fbf5df !important;
+  }
+
+  [class~="bg-amber-500"] {
+    background-color: #d5a900 !important;
+  }
+
+  [class~="hover:bg-amber-400"]:hover {
+    background-color: #e4b900 !important;
+  }
+
+  [class~="text-slate-100"] { color: #1c3024 !important; }
+  [class~="text-slate-200"] { color: #293d30 !important; }
+  [class~="text-slate-300"] { color: #3a5142 !important; }
+  [class~="text-slate-400"] { color: #586d5f !important; }
+  [class~="text-slate-500"] { color: #718177 !important; }
+  [class~="text-slate-950"] { color: #183122 !important; }
+
+  [class~="text-emerald-300"], [class~="text-emerald-400"] {
+    color: #17633b !important;
+  }
+
+  [class~="text-emerald-500"] { color: #08743f !important; }
+  [class~="text-amber-200"], [class~="text-amber-300"], [class~="text-amber-400"] {
+    color: #795d08 !important;
+  }
+
+  input[class*="bg-slate-950"], textarea[class*="bg-slate-950"], select[class*="bg-slate-950"] {
+    color: #1c3024 !important;
+  }
+
+  input::placeholder, textarea::placeholder {
+    color: #718177 !important;
+    opacity: 1;
+  }
+
+  input[type="checkbox"], input[type="radio"] {
+    accent-color: #08743f;
+  }
+
+  [class~="border-slate-700"], [class~="border-slate-800"], [class~="border-slate-900"] {
+    border-color: #d6e1d8 !important;
+  }
+
+  [class~="border-emerald-500"], [class~="border-emerald-700"], [class~="border-emerald-700/50"] {
+    border-color: #2d8150 !important;
+  }
+
+  [class~="border-amber-500"], [class~="border-amber-500/60"] {
+    border-color: #c29a12 !important;
+  }
+
+  [class~="from-emerald-600"] {
+    --tw-gradient-from: #08743f var(--tw-gradient-from-position) !important;
+    --tw-gradient-to: rgb(8 116 63 / 0) !important;
+  }
+
+  [class~="to-teal-600"] {
+    --tw-gradient-to: #176b45 var(--tw-gradient-to-position) !important;
+  }
+
+  [class~="hover:from-emerald-500"]:hover {
+    --tw-gradient-from: #0a8448 var(--tw-gradient-from-position) !important;
+    --tw-gradient-to: rgb(10 132 72 / 0) !important;
+  }
+
+  [class~="hover:to-teal-500"]:hover {
+    --tw-gradient-to: #218456 var(--tw-gradient-to-position) !important;
+  }
+}

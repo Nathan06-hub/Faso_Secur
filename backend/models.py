@@ -34,10 +34,14 @@ class EnrolledAgent(Base):
 
     # Authentification forte : Mot de passe haché bcrypt + Secret 2FA TOTP chiffré au repos (Fernet)
     password_hash = Column(String(256), nullable=False)
+    must_change_password = Column(Boolean, default=False, nullable=False)
     totp_secret_encrypted = Column(Text, nullable=False)
     totp_enabled = Column(Boolean, default=True, nullable=False)
-    enrolment_token = Column(String(128), nullable=True)
+    # SHA-256 du code d'activation remis hors bande; le code brut n'est jamais stocké.
+    enrolment_token = Column(String(64), nullable=True)
+    enrolment_token_expires_at = Column(DateTime, nullable=True)
     is_enrolled_activated = Column(Boolean, default=True, nullable=False)
+    is_demo_account = Column(Boolean, default=False, nullable=False)
 
     # Statut de révocation immédiate & mémorisation des canaux d'origine
     is_revoked = Column(Boolean, default=False, nullable=False)
@@ -56,6 +60,17 @@ class EnrolledAgent(Base):
     e2ee_key_epoch = Column(Integer, default=1, nullable=False)
 
     created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+class WebSocketTicket(Base):
+    """Ticket temporaire et à usage unique d'authentification WebSocket."""
+    __tablename__ = "websocket_tickets"
+
+    ticket_hash = Column(String(64), primary_key=True)
+    agent_id = Column(Integer, ForeignKey("enrolled_agents.id"), nullable=False, index=True)
+    token_version = Column(Integer, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    consumed_at = Column(DateTime, nullable=True)
 
 
 class Channel(Base):
@@ -99,8 +114,8 @@ class EncryptedMessage(Base):
     channel_id = Column(Integer, ForeignKey("channels.id"), nullable=False, index=True)
     sender_pseudonym_hash = Column(String(64), nullable=False, index=True)
 
-    # Protocole E2EE honnête et explicite (WebCrypto ECDH P-256 + HKDF-SHA256 + AES-256-GCM + ECDSA P-256)
-    e2ee_protocol = Column(String(64), default="WEBCRYPTO_ECDH_HKDF_AES256GCM_ECDSA", nullable=False)
+    # Protocole E2EE Signal (X3DH + Double Ratchet / Sender Key + AES-256-GCM + ECDSA P-256)
+    e2ee_protocol = Column(String(64), default="SIGNAL_X3DH_DOUBLERATCHET_AES256GCM_ECDSA", nullable=False)
     crypto_epoch = Column(Integer, default=1, nullable=False)
 
     # Payload strictement chiffré (Base64 AES-256-GCM paddé par bloc de 256 octets)

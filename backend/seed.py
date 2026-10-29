@@ -8,6 +8,7 @@ Conformément aux règles du sprint :
 """
 
 from sqlalchemy.orm import Session
+import auth
 from auth import encrypt_totp_secret_at_rest, get_timestamp_bucket, hash_password, pseudonymize_identifier
 from models import Channel, ChannelMember, EnrolledAgent, SecurityAuditLog
 
@@ -101,8 +102,45 @@ DEMO_CHANNELS = [
 ]
 
 
-def seed_demo_data(db: Session) -> None:
-    """Insère les agents fictifs enrôlés et les canaux institutionnels s'ils n'existent pas encore."""
+def seed_institutional_channels(db: Session) -> list[Channel]:
+    """
+    Initialise les canaux institutionnels souverains (Coordination Interministérielle,
+    Cellule de Veille, etc.) s'ils n'existent pas encore.
+    Ces canaux sont des espaces d'échange d'État légitimes et ne contiennent aucun secret
+    ni compte utilisateur.
+    """
+    existing = db.query(Channel).all()
+    if existing:
+        return existing
+
+    created = []
+    for ch in DEMO_CHANNELS:
+        channel = Channel(
+            slug=ch["slug"],
+            name=ch["name"],
+            ministry_scope=ch["ministry_scope"],
+            channel_type=ch["channel_type"],
+            default_classification=ch["default_classification"],
+            crypto_epoch=1,
+            encrypted_group_session_bundles="{}",
+        )
+        db.add(channel)
+        created.append(channel)
+
+    db.commit()
+    return created
+
+
+def seed_demo_data(db: Session, force_demo: bool = False) -> None:
+    """
+    Insère les agents fictifs de démonstration et les canaux institutionnels UNIQUEMENT
+    lorsque le mode démo est explicitement activé (`FASO_SECUR_DEMO_MODE=true` ou `force_demo=True`).
+    En production (`FASO_SECUR_DEMO_MODE=false` par défaut), aucun compte avec identifiants
+    connus n'est jamais créé automatiquement au démarrage sur une base vide.
+    """
+    if not (auth.DEMO_MODE_ENABLED or force_demo):
+        return
+
     existing_count = db.query(EnrolledAgent).count()
     if existing_count > 0:
         return
@@ -121,6 +159,7 @@ def seed_demo_data(db: Session) -> None:
             totp_secret_encrypted=encrypt_totp_secret_at_rest(item["totp_secret"]),
             totp_enabled=True,
             is_enrolled_activated=True,
+            is_demo_account=True,
             is_revoked=False,
             token_version=1,
         )
@@ -129,20 +168,7 @@ def seed_demo_data(db: Session) -> None:
 
     db.flush()
 
-    created_channels = []
-    for ch in DEMO_CHANNELS:
-        channel = Channel(
-            slug=ch["slug"],
-            name=ch["name"],
-            ministry_scope=ch["ministry_scope"],
-            channel_type=ch["channel_type"],
-            default_classification=ch["default_classification"],
-            crypto_epoch=1,
-        )
-        db.add(channel)
-        created_channels.append(channel)
-
-    db.flush()
+    created_channels = seed_institutional_channels(db)
 
     # Inscrire les agents enrôlés aux canaux correspondant à leur ministère (ou interministériels 'TOUS')
     for channel in created_channels:

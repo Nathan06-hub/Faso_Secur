@@ -22,8 +22,12 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Environment & OS
+# Environment, Secrets & OS
 .env
+.faso_secur_secrets/
+**/.faso_secur_secrets/
+.faso_secur_server_secrets.json
+**/.faso_secur_server_secrets.json
 .DS_Store
 Thumbs.db
 .vscode/

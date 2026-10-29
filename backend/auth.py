@@ -18,6 +18,7 @@ import hmac
 import json
 import os
 import secrets
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -36,25 +37,134 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
-from database import get_db
+from database import DATABASE_URL, get_db
 from models import EnrolledAgent
 
-# Clés serveur générées par CSPRNG au démarrage si non injectées par l'environnement
-# (Aucun secret statique codé en dur dans le code source)
-JWT_SECRET_KEY = os.getenv("FASO_SECUR_JWT_SECRET") or secrets.token_urlsafe(48)
-METADATA_HMAC_PEPPER = os.getenv("FASO_SECUR_METADATA_PEPPER") or secrets.token_urlsafe(32)
 
-# Clé Fernet (32 octets encodés en Base64 URL-safe) pour chiffrer `totp_secret` au repos en BDD
-_RAW_FERNET_ENV = os.getenv("FASO_SECUR_TOTP_FERNET_KEY")
+def _read_secret_from_env_or_file(env_var: str, file_env_var: str, default_secret_path: str = "") -> str:
+    """
+    Lit un secret serveur par ordre de priorité :
+    1. Variable d'environnement directe (`FASO_SECUR_*`)
+    2. Fichier de secret monté (`FASO_SECUR_*_FILE` ou `/run/secrets/...` — Docker Secrets / Vault)
+    """
+    direct_val = os.getenv(env_var, "").strip()
+    if direct_val:
+        return direct_val
+    file_path = os.getenv(file_env_var, "").strip() or default_secret_path
+    if file_path and os.path.isfile(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                content = fh.read().strip()
+                if content:
+                    return content
+        except Exception:
+            pass
+    return ""
+
+
+def _resolve_secrets_file_path() -> str:
+    """
+    Détermine l'emplacement persistant du fichier de secrets serveur dans un répertoire
+    SÉPARÉ du dossier de la base de données SQLite, afin que la compromission ou la copie
+    du fichier `.db` (ou de son volume `/app/data`) n'expose jamais la clé maîtresse Fernet,
+    la clé JWT ni le poivre HMAC.
+    """
+    explicit_path = os.getenv("FASO_SECUR_SECRETS_FILE", "").strip()
+    if explicit_path:
+        return explicit_path
+    # Par défaut, utilise un dossier dédié `.faso_secur_secrets` distinct du dossier `data/` de la BDD
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    secrets_dir = os.path.join(base_dir, ".faso_secur_secrets")
+    return os.path.join(secrets_dir, ".faso_secur_server_secrets.json")
+
+
+def _load_or_create_persistent_secrets() -> Dict[str, str]:
+    secrets_path = _resolve_secrets_file_path()
+    stored: Dict[str, str] = {}
+    if os.path.exists(secrets_path):
+        try:
+            with open(secrets_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    stored = {str(k): str(v) for k, v in data.items() if v}
+        except Exception:
+            stored = {}
+
+    changed = False
+    if not stored.get("jwt_secret"):
+        stored["jwt_secret"] = secrets.token_urlsafe(48)
+        changed = True
+    if not stored.get("metadata_pepper"):
+        stored["metadata_pepper"] = secrets.token_urlsafe(32)
+        changed = True
+    if not stored.get("totp_fernet_key"):
+        stored["totp_fernet_key"] = Fernet.generate_key().decode("utf-8")
+        changed = True
+
+    if changed:
+        try:
+            os.makedirs(os.path.dirname(secrets_path), exist_ok=True)
+            with open(secrets_path, "w", encoding="utf-8") as fh:
+                json.dump(stored, fh, indent=2)
+            try:
+                os.chmod(secrets_path, 0o600)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    return stored
+
+
+def _normalize_fernet_key(raw_key: str) -> bytes:
+    cleaned = raw_key.strip()
+    try:
+        decoded = base64.urlsafe_b64decode(cleaned.encode("utf-8"))
+        if len(decoded) == 32:
+            return cleaned.encode("utf-8")
+    except Exception:
+        pass
+    return base64.urlsafe_b64encode(hashlib.sha256(cleaned.encode("utf-8")).digest())
+
+
+_PERSISTENT_SECRETS = _load_or_create_persistent_secrets()
+
+# Clés serveur fournies par l'environnement / Docker Secrets ou persistées sur un volume dédié séparé de la BDD
+JWT_SECRET_KEY = (
+    _read_secret_from_env_or_file(
+        "FASO_SECUR_JWT_SECRET",
+        "FASO_SECUR_JWT_SECRET_FILE",
+        "/run/secrets/faso_secur_jwt_secret",
+    )
+    or _PERSISTENT_SECRETS["jwt_secret"]
+)
+METADATA_HMAC_PEPPER = (
+    _read_secret_from_env_or_file(
+        "FASO_SECUR_METADATA_PEPPER",
+        "FASO_SECUR_METADATA_PEPPER_FILE",
+        "/run/secrets/faso_secur_metadata_pepper",
+    )
+    or _PERSISTENT_SECRETS["metadata_pepper"]
+)
+
+# Clé Fernet (accepte variable directe, fichier Docker Secret `/run/secrets/faso_secur_totp_fernet_key` ou clé persistée)
+_RAW_FERNET_ENV = (
+    _read_secret_from_env_or_file(
+        "FASO_SECUR_TOTP_FERNET_KEY",
+        "FASO_SECUR_TOTP_FERNET_KEY_FILE",
+        "/run/secrets/faso_secur_totp_fernet_key",
+    )
+    or os.getenv("FASO_SECUR_TOTP_ENCRYPTION_KEY", "").strip()
+)
 if _RAW_FERNET_ENV:
-    _FERNET_KEY = base64.urlsafe_b64encode(hashlib.sha256(_RAW_FERNET_ENV.encode("utf-8")).digest())
+    _FERNET_KEY = _normalize_fernet_key(_RAW_FERNET_ENV)
 else:
-    _FERNET_KEY = Fernet.generate_key()
+    _FERNET_KEY = _normalize_fernet_key(_PERSISTENT_SECRETS["totp_fernet_key"])
 
 _totp_fernet = Fernet(_FERNET_KEY)
 
-# Par défaut en production, DEMO_MODE est désactivé sauf si explicitement activé (ex: tests / démo jury)
-DEMO_MODE_ENABLED = os.getenv("FASO_SECUR_DEMO_MODE", "false").lower() in ("1", "true", "yes")
+# Par défaut en production, DEMO_MODE est strictement désactivé (false)
+DEMO_MODE_ENABLED = os.getenv("FASO_SECUR_DEMO_MODE", "false").strip().lower() in ("1", "true", "yes")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480
 
@@ -96,6 +206,95 @@ class LoginRateLimiter:
 
 
 login_rate_limiter = LoginRateLimiter(max_attempts=5, window_seconds=300)
+
+
+class PreKeyReservationRateLimiter:
+    """
+    Limiteur de débit dédié à la réservation des pré-clés Signal à usage unique
+    (POST /api/e2ee/prekeys/consume/{target_matricule}) afin de réduire le risque
+    d'épuisement volontaire (Pre-Key Exhaustion DoS) des pré-clés d'un destinataire.
+    """
+
+    def __init__(
+        self,
+        max_per_actor: int = 30,
+        max_per_pair: int = 8,
+        window_seconds: int = 60,
+    ) -> None:
+        self.max_per_actor = max_per_actor
+        self.max_per_pair = max_per_pair
+        self.window_seconds = window_seconds
+        self._actor_requests: Dict[str, List[float]] = defaultdict(list)
+        self._pair_requests: Dict[str, List[float]] = defaultdict(list)
+
+    def check_and_record(self, actor_matricule: str, target_matricule: str) -> None:
+        now = time.time()
+        actor_key = actor_matricule.strip().upper()
+        target_key = target_matricule.strip().upper()
+        pair_key = f"{actor_key}->{target_key}"
+
+        self._actor_requests[actor_key] = [
+            ts for ts in self._actor_requests[actor_key] if now - ts < self.window_seconds
+        ]
+        self._pair_requests[pair_key] = [
+            ts for ts in self._pair_requests[pair_key] if now - ts < self.window_seconds
+        ]
+
+        if (
+            len(self._actor_requests[actor_key]) >= self.max_per_actor
+            or len(self._pair_requests[pair_key]) >= self.max_per_pair
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    "LIMITATION DE DÉBIT SIGNAL X3DH : Trop de réservations de pré-clés à usage unique "
+                    f"par '{actor_key}' vers '{target_key}'. Réessayez ultérieurement."
+                ),
+            )
+
+        self._actor_requests[actor_key].append(now)
+        self._pair_requests[pair_key].append(now)
+
+    def reset(self) -> None:
+        self._actor_requests.clear()
+        self._pair_requests.clear()
+
+
+prekey_reservation_rate_limiter = PreKeyReservationRateLimiter()
+
+
+class WebSocketTicketRateLimiter:
+    """Limite les écritures de tickets courts par session agent authentifiée."""
+
+    def __init__(self, max_requests: int = 20, window_seconds: int = 60) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: Dict[int, List[float]] = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def check_and_record(self, agent_id: int) -> None:
+        now = time.time()
+        with self._lock:
+            recent = [
+                timestamp
+                for timestamp in self._requests[agent_id]
+                if now - timestamp < self.window_seconds
+            ]
+            if len(recent) >= self.max_requests:
+                self._requests[agent_id] = recent
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Trop de demandes de tickets WebSocket. Réessayez dans une minute.",
+                )
+            recent.append(now)
+            self._requests[agent_id] = recent
+
+    def reset(self) -> None:
+        with self._lock:
+            self._requests.clear()
+
+
+websocket_ticket_rate_limiter = WebSocketTicketRateLimiter(max_requests=20, window_seconds=60)
 
 
 # ============================================================================
@@ -156,14 +355,20 @@ def _build_pyca_totp(base32_secret: str) -> TOTP:
 
 def generate_current_totp_code(encrypted_or_plain_secret: str, timestamp: Optional[float] = None) -> str:
     """Génère le code TOTP à 6 chiffres pour l'instant courant."""
-    base32_secret = (
-        decrypt_totp_secret_at_rest(encrypted_or_plain_secret)
-        if encrypted_or_plain_secret.startswith("gAAAAA")
-        else encrypted_or_plain_secret
-    )
-    totp = _build_pyca_totp(base32_secret)
-    ts = int(timestamp if timestamp is not None else time.time())
-    return totp.generate(ts).decode("utf-8")
+    try:
+        base32_secret = (
+            decrypt_totp_secret_at_rest(encrypted_or_plain_secret)
+            if encrypted_or_plain_secret.startswith("gAAAAA")
+            else encrypted_or_plain_secret
+        )
+        totp = _build_pyca_totp(base32_secret)
+        ts = int(timestamp if timestamp is not None else time.time())
+        return totp.generate(ts).decode("utf-8")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Impossible de déchiffrer la graine TOTP avec la clé Fernet active.",
+        ) from exc
 
 
 def verify_totp_code(encrypted_or_plain_secret: str, code: str, window: int = 1) -> bool:
@@ -301,6 +506,14 @@ def verify_and_load_active_agent(token: str, db: Session) -> EnrolledAgent:
             detail="Accès refusé : agent non enrôlé dans l'annuaire souverain DGTD.",
         )
 
+    # Demo accounts must never remain usable after switching a persistent database
+    # from demo mode to production mode.
+    if agent.is_demo_account and not DEMO_MODE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Accès refusé : compte de démonstration désactivé hors mode démo.",
+        )
+
     if agent.is_revoked:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -333,6 +546,26 @@ def require_admin_role(current_agent: EnrolledAgent = Depends(get_current_agent)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Action réservée aux administrateurs ou auditeurs habilités (DGTD / Point Focal).",
+        )
+    return current_agent
+
+
+def require_account_manager(current_agent: EnrolledAgent = Depends(get_current_agent)) -> EnrolledAgent:
+    """Allow account changes only to DGTD administrators and ministry focal points."""
+    if current_agent.role not in ("SUPER_ADMIN_DGTD", "POINT_FOCAL"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La gestion des comptes est réservée à la DGTD et aux points focaux.",
+        )
+    return current_agent
+
+
+def require_super_admin(current_agent: EnrolledAgent = Depends(get_current_agent)) -> EnrolledAgent:
+    """Only DGTD administrators may grant or revoke privileged roles."""
+    if current_agent.role != "SUPER_ADMIN_DGTD":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cette opération est réservée à un administrateur DGTD.",
         )
     return current_agent
 

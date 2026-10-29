@@ -1,0 +1,36 @@
+# Surcouche de déploiement Réseau / Production avec terminaison HTTPS / TLS 1.3 (WSS + HSTS)
+# Usage : docker compose -f docker-compose.yml -f docker-compose.tls.yml up --build
+
+services:
+  faso-secur-backend:
+    ports: !override []
+    expose:
+      - "8000"
+
+  faso-secur-frontend:
+    ports: !override []
+    expose:
+      - "5173"
+
+  faso-secur-tls-proxy:
+    image: caddy:2-alpine
+    container_name: faso-secur-tls-proxy
+    ports:
+      - "443:443"
+      - "8443:8443"
+    environment:
+      - FASO_SECUR_DOMAIN=${FASO_SECUR_DOMAIN:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - faso_secur_caddy_data:/data
+      - faso_secur_caddy_config:/config
+    depends_on:
+      faso-secur-backend:
+        condition: service_healthy
+      faso-secur-frontend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  faso_secur_caddy_data:
+  faso_secur_caddy_config:

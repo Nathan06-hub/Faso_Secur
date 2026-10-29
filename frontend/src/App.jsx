@@ -16,6 +16,7 @@ import {
   Mic,
   Paperclip,
   Play,
+  Plus,
   RefreshCw,
   Send,
   Shield,
@@ -30,6 +31,7 @@ import {
   Users,
   Wifi,
   WifiOff,
+  X,
 } from 'lucide-react';
 import {
   syncChannelGroupSecret,
@@ -39,6 +41,7 @@ import {
   encryptBinaryAttachmentE2EE,
   encryptE2EEMessagePayload,
   getPublicBundleForServer,
+  hasEstablishedSignalSession,
   initializeAgentKeystore,
   signProbativeReadReceipt,
   wipeLocalCryptoKeystore,
@@ -46,6 +49,58 @@ import {
 import { LANGUAGES, TRANSLATIONS } from './i18n/translations';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
+
+// Graines TOTP RFC 6238 des 5 profils fictifs de démonstration (documentées dans le README pour le jury)
+// Calculées 100 % localement côté navigateur (Simulateur d'application 2FA) afin qu'aucun endpoint
+// public du serveur ne transmette jamais de mot de passe ni de code TOTP sur le réseau.
+const FICTIONAL_DEMO_TOTP_SEEDS = {
+  'BF-DGTD-001': 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXA',
+  'BF-MEFP-102': 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXB',
+  'BF-MATDS-204': 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXC',
+  'BF-SANTE-308': 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXD',
+  'BF-MISSION-999': 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXE',
+};
+
+function base32ToUint8Array(base32) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = base32.toUpperCase().replace(/=+$/, '').trim();
+  let bits = '';
+  for (let i = 0; i < clean.length; i += 1) {
+    const val = alphabet.indexOf(clean[i]);
+    if (val >= 0) bits += val.toString(2).padStart(5, '0');
+  }
+  const bytes = new Uint8Array(Math.floor(bits.length / 8));
+  for (let i = 0; i < bytes.length; i += 1) {
+    bytes[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
+  }
+  return bytes;
+}
+
+async function computeLocalDemoTotpCode(matricule) {
+  const seed = FICTIONAL_DEMO_TOTP_SEEDS[matricule];
+  if (!seed || !window.crypto?.subtle) return '';
+  const keyBytes = base32ToUint8Array(seed);
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  const counterBuf = new ArrayBuffer(8);
+  const view = new DataView(counterBuf);
+  view.setUint32(0, Math.floor(counter / 0x100000000), false);
+  view.setUint32(4, counter >>> 0, false);
+  const hmacKey = await window.crypto.subtle.importKey(
+    'raw',
+    keyBytes,
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+  const mac = new Uint8Array(await window.crypto.subtle.sign('HMAC', hmacKey, counterBuf));
+  const offset = mac[mac.length - 1] & 0x0f;
+  const binary =
+    ((mac[offset] & 0x7f) << 24) |
+    ((mac[offset + 1] & 0xff) << 16) |
+    ((mac[offset + 2] & 0xff) << 8) |
+    (mac[offset + 3] & 0xff);
+  return String(binary % 1000000).padStart(6, '0');
+}
 
 /**
  * Génère un petit fichier WAV synthétique (bip vocal de radio-transmission) si le poste
@@ -112,11 +167,21 @@ export default function App() {
 
   // Comptes de démo fictifs pour le jury
   const [demoAccounts, setDemoAccounts] = useState([]);
-  const [loginMatricule, setLoginMatricule] = useState('BF-DGTD-001');
-  const [loginPassword, setLoginPassword] = useState('FasoSecur!2026');
+  const [loginMatricule, setLoginMatricule] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
   const [loginTotp, setLoginTotp] = useState('');
+  const [authMode, setAuthMode] = useState('login');
+  const [activationCode, setActivationCode] = useState('');
+  const [activationToken, setActivationToken] = useState('');
+  const [activationTotpSecret, setActivationTotpSecret] = useState('');
+  const [activationTotpCode, setActivationTotpCode] = useState('');
   const [authAlert, setAuthAlert] = useState(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [passwordChangeToken, setPasswordChangeToken] = useState('');
+  const [passwordChangeAgent, setPasswordChangeAgent] = useState(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [isChangingPassword, setIsChangingPassword] = useState(false);
 
   // Navigation principale : 'chat' | 'directory' | 'admin' | 'inspector'
   const [activeTab, setActiveTab] = useState('chat');
@@ -152,15 +217,24 @@ export default function App() {
 
   // Formulaire d'enrôlement d'un nouvel agent (Admin DGTD)
   const [newAgentForm, setNewAgentForm] = useState({
-    matricule: 'BF-EDUC-405',
-    full_name: 'Salifou OUATTARA (Fictif)',
-    ministry: 'MENAPLN (Éducation Nationale)',
-    direction: 'Direction des Systèmes Numériques Éducatifs',
-    job_title: 'Ingénieur Réseau Souverain',
+    matricule: '',
+    full_name: '',
+    ministry: '',
+    direction: '',
+    job_title: '',
     role: 'AGENT_PUBLIC',
     preferred_lang: 'fr',
   });
   const [enrolmentResult, setEnrolmentResult] = useState(null);
+  const [roleDrafts, setRoleDrafts] = useState({});
+  const [showNewChannelModal, setShowNewChannelModal] = useState(false);
+  const [newChannelForm, setNewChannelForm] = useState({
+    name: '',
+    ministry_scope: 'TOUS',
+    channel_type: 'GROUP',
+    default_classification: 'DIFFUSION_RESTREINTE',
+    member_ids: [],
+  });
 
   const wsRef = useRef(null);
 
@@ -172,11 +246,20 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/auth/demo-accounts`);
       if (res.ok) {
         const data = await res.json();
-        setDemoAccounts(data.demo_accounts || []);
-        const selected = (data.demo_accounts || []).find((a) => a.matricule === loginMatricule);
-        if (selected) {
-          setLoginTotp(selected.current_totp_code);
+        const rawList = data.demo_accounts || [];
+        const enriched = await Promise.all(
+          rawList.map(async (acc) => ({
+            ...acc,
+            local_totp_code: await computeLocalDemoTotpCode(acc.matricule),
+          }))
+        );
+        setDemoAccounts(enriched);
+        const selected = enriched.find((a) => a.matricule === loginMatricule);
+        if (selected && selected.local_totp_code) {
+          setLoginTotp(selected.local_totp_code);
         }
+      } else {
+        setDemoAccounts([]);
       }
     } catch {
       // Serveur en cours de démarrage
@@ -217,60 +300,83 @@ export default function App() {
 
     setupCryptoAndData();
 
-    // Connexion WebSocket Temps Réel avec écoute du signal REMOTE_WIPE_AND_REVOKE
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = import.meta.env.VITE_WS_HOST || window.location.host;
-    const wsUrl = `${wsProtocol}//${wsHost}/ws?token=${encodeURIComponent(token)}`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-
-    ws.onopen = () => setWsConnected(true);
-    ws.onclose = (ev) => {
-      setWsConnected(false);
-      if (ev.code === 4003) {
-        handleRemoteRevocationLockdown('Votre session a été coupée par révocation immédiate DGTD.');
-      }
-    };
-
-    ws.onmessage = async (event) => {
+    // Le JWT n'est jamais inclus dans l'URL : un ticket opaque, bref et à usage unique
+    // est échangé via HTTPS, puis seul ce ticket temporaire est transmis au handshake WS.
+    let ws;
+    async function connectWebSocket() {
       try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'REMOTE_WIPE_AND_REVOKE') {
-          handleRemoteRevocationLockdown(data.reason || 'Révocation immédiate par la DGTD.');
-          return;
-        }
-        if (data.type === 'GROUP_CRYPTO_EPOCH_ROTATED') {
-          setSecurityBanner({
-            type: 'EPOCH_ROTATED',
-            text: `Sécurité E2EE : L'agent ${data.revoked_matricule} a été révoqué (${data.reason}). Rotation immédiate des clés de session de groupe effectuée !`,
-          });
-          await loadChannelsAndDirectory(token);
-          if (selectedChannelId) {
-            await loadChannelMessages(selectedChannelId, token);
+        const ticketResponse = await fetch(`${API_BASE}/api/auth/ws-ticket`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          cache: 'no-store',
+        });
+        if (!ticketResponse.ok) {
+          if (ticketResponse.status === 401 || ticketResponse.status === 403) {
+            handleRemoteRevocationLockdown('Session révoquée ou expirée.');
           }
           return;
         }
-        if (data.type === 'NEW_E2EE_MESSAGE' && data.message) {
-          if (data.message.channel_id === selectedChannelId) {
-            setMessages((prev) => {
-              if (prev.some((m) => m.id === data.message.id)) return prev;
-              return [...prev, data.message];
-            });
+        const { ticket } = await ticketResponse.json();
+        if (!isMounted) return;
+
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsHost = import.meta.env.VITE_WS_HOST || window.location.host;
+        const wsUrl = `${wsProtocol}//${wsHost}/ws?ticket=${encodeURIComponent(ticket)}`;
+        ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+
+        ws.onopen = () => setWsConnected(true);
+        ws.onclose = (ev) => {
+          setWsConnected(false);
+          if (ev.code === 4003) {
+            handleRemoteRevocationLockdown('Votre session a été coupée par révocation immédiate DGTD.');
           }
-        }
-        if (data.type === 'PROBATIVE_RECEIPT_SIGNED') {
-          if (data.channel_id === selectedChannelId) {
-            await loadChannelMessages(selectedChannelId, token);
+        };
+
+        ws.onmessage = async (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'REMOTE_WIPE_AND_REVOKE') {
+              handleRemoteRevocationLockdown(data.reason || 'Révocation immédiate par la DGTD.');
+              return;
+            }
+            if (data.type === 'GROUP_CRYPTO_EPOCH_ROTATED') {
+              setSecurityBanner({
+                type: 'EPOCH_ROTATED',
+                text: `Sécurité E2EE : L'agent ${data.revoked_matricule} a été révoqué (${data.reason}). Rotation immédiate des clés de session de groupe effectuée !`,
+              });
+              await loadChannelsAndDirectory(token);
+              if (selectedChannelId) {
+                await loadChannelMessages(selectedChannelId, token);
+              }
+              return;
+            }
+            if (data.type === 'NEW_E2EE_MESSAGE' && data.message) {
+              if (data.message.channel_id === selectedChannelId) {
+                setMessages((prev) => {
+                  if (prev.some((m) => m.id === data.message.id)) return prev;
+                  return [...prev, data.message];
+                });
+              }
+            }
+            if (data.type === 'PROBATIVE_RECEIPT_SIGNED') {
+              if (data.channel_id === selectedChannelId) {
+                await loadChannelMessages(selectedChannelId, token);
+              }
+            }
+          } catch {
+            // Ignorer trame malformée
           }
-        }
+        };
       } catch {
-        // Ignorer trame malformée
+        setWsConnected(false);
       }
-    };
+    }
+    connectWebSocket();
 
     return () => {
       isMounted = false;
-      ws.close();
+      if (ws) ws.close();
     };
   }, [token, currentAgent?.matricule, selectedChannelId]);
 
@@ -282,7 +388,11 @@ export default function App() {
       const updates = {};
       for (const msg of messages) {
         if (!decryptedMap[msg.id]?.decryptedOk) {
-          updates[msg.id] = await decryptE2EEMessagePayload(msg, activeMembers);
+          updates[msg.id] = await decryptE2EEMessagePayload(
+            msg,
+            activeMembers,
+            keystoreRef.current
+          );
         }
       }
       if (Object.keys(updates).length > 0) {
@@ -301,6 +411,7 @@ export default function App() {
     setKeystore(null);
     setMessages([]);
     setDecryptedMap({});
+    setEnrolmentResult(null);
     setRevokedLockdown(reason);
   };
 
@@ -345,8 +456,22 @@ export default function App() {
               return false;
             }
           };
+          const onConflictReload = async () => {
+            try {
+              const reloadRes = await fetch(`${API_BASE}/api/channels`, {
+                headers: { Authorization: `Bearer ${jwt}` },
+              });
+              if (!reloadRes.ok) return null;
+              const reloadData = await reloadRes.json();
+              const updatedList = reloadData.channels || [];
+              setChannels(updatedList);
+              return updatedList.find((c) => c.id === ch.id) || null;
+            } catch {
+              return null;
+            }
+          };
           try {
-            await syncChannelGroupSecret({ channel: ch, keystore: ks, publish });
+            await syncChannelGroupSecret({ channel: ch, keystore: ks, publish, onConflictReload });
           } catch {
             // Secret non disponible : réessayé à la prochaine synchronisation
           }
@@ -409,10 +534,11 @@ export default function App() {
   // ============================================================================
   // CONNEXION & SIMULATION D'INTRUS (ÉPREUVE DU JURY)
   // ============================================================================
-  const handleSelectDemoAccount = (acc) => {
+  const handleSelectDemoAccount = async (acc) => {
     setLoginMatricule(acc.matricule);
-    setLoginPassword(acc.demo_password || 'FasoSecur!2026');
-    setLoginTotp(acc.current_totp_code || '');
+    setLoginPassword('FasoSecur!2026');
+    const code = acc.local_totp_code || (await computeLocalDemoTotpCode(acc.matricule));
+    setLoginTotp(code || '');
     setAuthAlert(null);
   };
 
@@ -435,6 +561,12 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) {
         setAuthAlert({ type: 'error', message: data.detail || 'Erreur de connexion' });
+      } else if (data.password_change_required) {
+        setPasswordChangeToken(data.password_change_token);
+        setPasswordChangeAgent(data.agent);
+        if (data.agent.preferred_lang && TRANSLATIONS[data.agent.preferred_lang]) {
+          setLang(data.agent.preferred_lang);
+        }
       } else {
         window.sessionStorage.setItem('faso_secur_jwt', data.access_token);
         window.sessionStorage.setItem('faso_secur_agent', JSON.stringify(data.agent));
@@ -448,6 +580,120 @@ export default function App() {
       setAuthAlert({ type: 'error', message: `Erreur réseau : ${err.message}` });
     } finally {
       setIsLoggingIn(false);
+    }
+  };
+
+  const handleActivationStart = async (e) => {
+    e.preventDefault();
+    setAuthAlert(null);
+    setIsLoggingIn(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/activation/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({ matricule: loginMatricule, activation_code: activationCode }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthAlert({ type: 'error', message: data.detail || 'Code d’activation invalide.' });
+        return;
+      }
+      setActivationToken(data.activation_token);
+      setActivationTotpSecret(data.totp_secret);
+      setActivationCode('');
+      setActivationTotpCode('');
+      setNewPassword('');
+      setConfirmNewPassword('');
+    } catch (err) {
+      setAuthAlert({ type: 'error', message: `Erreur réseau : ${err.message}` });
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleActivationComplete = async (e) => {
+    e.preventDefault();
+    setAuthAlert(null);
+    if (newPassword !== confirmNewPassword) {
+      setAuthAlert({ type: 'error', message: 'Les deux mots de passe ne correspondent pas.' });
+      return;
+    }
+    setIsChangingPassword(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/activation/complete`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${activationToken}`,
+        },
+        cache: 'no-store',
+        body: JSON.stringify({ new_password: newPassword, totp_code: activationTotpCode }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthAlert({ type: 'error', message: data.detail || 'Impossible d’activer le compte.' });
+        return;
+      }
+      window.sessionStorage.setItem('faso_secur_jwt', data.access_token);
+      window.sessionStorage.setItem('faso_secur_agent', JSON.stringify(data.agent));
+      setToken(data.access_token);
+      setCurrentAgent(data.agent);
+      setActivationToken('');
+      setActivationTotpSecret('');
+      setActivationTotpCode('');
+      setNewPassword('');
+      setConfirmNewPassword('');
+      setAuthMode('login');
+      if (data.agent.preferred_lang && TRANSLATIONS[data.agent.preferred_lang]) {
+        setLang(data.agent.preferred_lang);
+      }
+    } catch (err) {
+      setAuthAlert({ type: 'error', message: `Erreur réseau : ${err.message}` });
+    } finally {
+      setIsChangingPassword(false);
+    }
+  };
+
+  const handleFirstPasswordChange = async (e) => {
+    e.preventDefault();
+    setAuthAlert(null);
+    if (newPassword !== confirmNewPassword) {
+      setAuthAlert({ type: 'error', message: 'Les deux mots de passe ne correspondent pas.' });
+      return;
+    }
+
+    setIsChangingPassword(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/first-password-change`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${passwordChangeToken}`,
+        },
+        body: JSON.stringify({ new_password: newPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthAlert({ type: 'error', message: data.detail || 'Impossible de modifier le mot de passe.' });
+        return;
+      }
+
+      window.sessionStorage.setItem('faso_secur_jwt', data.access_token);
+      window.sessionStorage.setItem('faso_secur_agent', JSON.stringify(data.agent));
+      setToken(data.access_token);
+      setCurrentAgent(data.agent);
+      setPasswordChangeToken('');
+      setPasswordChangeAgent(null);
+      setNewPassword('');
+      setConfirmNewPassword('');
+      if (data.agent.preferred_lang && TRANSLATIONS[data.agent.preferred_lang]) {
+        setLang(data.agent.preferred_lang);
+      }
+    } catch (err) {
+      setAuthAlert({ type: 'error', message: `Erreur réseau : ${err.message}` });
+    } finally {
+      setIsChangingPassword(false);
     }
   };
 
@@ -476,12 +722,14 @@ export default function App() {
     setToken('');
     setCurrentAgent(null);
     setMessages([]);
+    setEnrolmentResult(null);
   };
 
   const handlePanicWipe = () => {
     wipeLocalCryptoKeystore();
     setToken('');
     setCurrentAgent(null);
+    setEnrolmentResult(null);
     setRevokedLockdown(
       "BOUTON D'URGENCE ACTIVÉ : Toutes les clés cryptographiques E2EE locales et le cache de session ont été intégralement purgés de cet appareil."
     );
@@ -491,6 +739,46 @@ export default function App() {
   // ENVOI DE MESSAGES, FICHIERS & NOTES VOCALES CHIFFRÉS DE BOUT EN BOUT
   // ============================================================================
   const currentChannel = channels.find((c) => c.id === selectedChannelId) || channels[0];
+  const canManageAccounts = ['SUPER_ADMIN_DGTD', 'POINT_FOCAL'].includes(currentAgent?.role);
+  const canInspectSecurity = ['SUPER_ADMIN_DGTD', 'POINT_FOCAL', 'AUDITEUR'].includes(currentAgent?.role);
+
+  // Réserve et consomme atomiquement les One-Time PreKeys Signal auprès du serveur pour les nouveaux correspondants
+  const resolveActiveMembersPrekeys = async (channelId, members) => {
+    if (!keystore || !Array.isArray(members)) return members || [];
+    const resolved = await Promise.all(
+      members.map(async (m) => {
+        if (!m || !m.matricule || m.matricule === currentAgent?.matricule) return m;
+        const hasSession = await hasEstablishedSignalSession(keystore, m.matricule);
+        if (!hasSession) {
+          try {
+            const resp = await fetch(
+              `${API_BASE}/api/e2ee/prekeys/consume/${encodeURIComponent(m.matricule)}?channel_id=${channelId}`,
+              {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${token}` },
+              }
+            );
+            if (resp.ok) {
+              const data = await resp.json();
+              if (data?.signal_prekey_bundle) {
+                return {
+                  ...m,
+                  e2ee_one_time_prekeys_json: JSON.stringify({
+                    protocol: data.protocol || 'SIGNAL_X3DH_DOUBLERATCHET_AES256GCM_ECDSA',
+                    signal_prekey_bundle: data.signal_prekey_bundle,
+                  }),
+                };
+              }
+            }
+          } catch {
+            // Repli gracieux sur le faisceau initial si hors-ligne ou indisponible
+          }
+        }
+        return m;
+      })
+    );
+    return resolved;
+  };
 
   const handleSendEncryptedText = async (e) => {
     e.preventDefault();
@@ -520,11 +808,17 @@ export default function App() {
       sentAtClient: new Date().toISOString(),
     };
 
+    const activeMembers = await resolveActiveMembersPrekeys(
+      currentChannel.id,
+      currentChannel.active_members || []
+    );
+
     const envelope = await encryptE2EEMessagePayload({
       channelId: currentChannel.id,
       cryptoEpoch: currentChannel.crypto_epoch || 1,
       plaintextObject,
       keystore,
+      activeMembers,
     });
 
     const requestBody = {
@@ -607,7 +901,7 @@ export default function App() {
         fileName: `Note_Vocale_${voiceNoteLang}_${new Date().toLocaleTimeString('fr-FR')}.wav`,
         mimeType: 'audio/wav',
         messageKind: 'VOICE_NOTE',
-        caption: `Message vocal officiel en langue nationale (${voiceNoteLang}) — Chiffré de bout en bout (AES-256-GCM)`,
+        caption: `Message vocal officiel en langue nationale (${voiceNoteLang}) — Chiffré de bout en bout (Signal + AES-256-GCM)`,
       });
     }
   };
@@ -632,11 +926,7 @@ export default function App() {
   };
 
   const uploadAndSendEncryptedBlob = async ({ dataUrl, fileName, mimeType, messageKind, caption }) => {
-    const encryptedBlob = await encryptBinaryAttachmentE2EE(
-      dataUrl,
-      currentChannel.id,
-      currentChannel.crypto_epoch || 1
-    );
+    const encryptedBlob = await encryptBinaryAttachmentE2EE(dataUrl);
 
     const blobRes = await fetch(`${API_BASE}/api/blobs`, {
       method: 'POST',
@@ -660,6 +950,8 @@ export default function App() {
       mimeType,
       voiceLang: voiceNoteLang,
       blobId: blobMeta.blob_id,
+      attachmentKeyB64: encryptedBlob.attachment_key_b64,
+      attachmentIvB64: encryptedBlob.iv_b64,
       sha256Ciphertext: blobMeta.sha256_ciphertext,
       senderMatricule: currentAgent.matricule,
       senderName: currentAgent.full_name,
@@ -672,11 +964,17 @@ export default function App() {
       lang,
     };
 
+    const activeMembers = await resolveActiveMembersPrekeys(
+      currentChannel.id,
+      currentChannel.active_members || []
+    );
+
     const envelope = await encryptE2EEMessagePayload({
       channelId: currentChannel.id,
       cryptoEpoch: currentChannel.crypto_epoch || 1,
       plaintextObject,
       keystore,
+      activeMembers,
     });
 
     const msgRes = await fetch(`${API_BASE}/api/channels/${currentChannel.id}/messages`, {
@@ -700,6 +998,10 @@ export default function App() {
 
   const handleDecryptAndLoadBlob = async (msg) => {
     if (!msg.encrypted_blob_id || decryptedBlobsMap[msg.encrypted_blob_id]) return;
+    const dec = decryptedMap[msg.id];
+    const attachmentKeyB64 = dec?.content?.attachmentKeyB64;
+    if (!attachmentKeyB64) return;
+
     const res = await fetch(`${API_BASE}/api/blobs/${msg.encrypted_blob_id}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -708,8 +1010,7 @@ export default function App() {
       const dataUrl = await decryptBinaryAttachmentE2EE(
         blobData.ciphertext_b64,
         blobData.iv_b64,
-        msg.channel_id,
-        msg.crypto_epoch || 1
+        attachmentKeyB64
       );
       setDecryptedBlobsMap((prev) => ({ ...prev, [msg.encrypted_blob_id]: dataUrl }));
     }
@@ -778,14 +1079,34 @@ export default function App() {
     }
   };
 
+  const handleChangeAgentRole = async (agent) => {
+    const role = roleDrafts[agent.id] || agent.role;
+    if (role === agent.role || !window.confirm(`Confirmer le changement de rôle de ${agent.full_name} ?`)) return;
+    const res = await fetch(`${API_BASE}/api/admin/agents/${agent.id}/role`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ role }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setSecurityBanner({ type: 'ROLE_ERROR', text: data.detail || 'Le rôle n’a pas pu être modifié.' });
+      return;
+    }
+    setSecurityBanner({ type: 'ROLE_CHANGED', text: `Rôle de ${agent.full_name} mis à jour.` });
+    setRoleDrafts((prev) => ({ ...prev, [agent.id]: role }));
+    await loadChannelsAndDirectory(token);
+  };
+
   const handleEnrolNewAgent = async (e) => {
     e.preventDefault();
+    setEnrolmentResult(null);
     const res = await fetch(`${API_BASE}/api/admin/enrol`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
+      cache: 'no-store',
       body: JSON.stringify(newAgentForm),
     });
     const data = await res.json();
@@ -793,6 +1114,56 @@ export default function App() {
       setEnrolmentResult(data);
       await loadChannelsAndDirectory(token);
       await fetchDemoAccounts();
+    }
+  };
+
+  const handleReissueActivationCode = async (agent) => {
+    if (!window.confirm(`Générer un nouveau code et invalider l’invitation précédente de ${agent.full_name} ?`)) return;
+    setEnrolmentResult(null);
+    const res = await fetch(`${API_BASE}/api/admin/agents/${agent.id}/activation-code`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setSecurityBanner({ type: 'ACTIVATION_ERROR', text: data.detail || 'Le code ne peut pas être réémis.' });
+      return;
+    }
+    setEnrolmentResult(data);
+    await loadChannelsAndDirectory(token);
+  };
+
+  const handleCreateChannel = async (e) => {
+    e.preventDefault();
+    if (!newChannelForm.name.trim()) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/channels`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(newChannelForm),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSecurityBanner({ type: 'CHANNEL_ERROR', text: data.detail || 'Impossible de créer le canal.' });
+        return;
+      }
+      setShowNewChannelModal(false);
+      setNewChannelForm({
+        name: '',
+        ministry_scope: currentAgent?.role === 'SUPER_ADMIN_DGTD' ? 'TOUS' : currentAgent?.ministry || 'TOUS',
+        channel_type: 'GROUP',
+        default_classification: 'DIFFUSION_RESTREINTE',
+        member_ids: [],
+      });
+      await loadChannelsAndDirectory(token);
+      setSelectedChannelId(data.id);
+      setSecurityBanner({ type: 'CHANNEL_CREATED', text: `Canal « ${data.name} » créé avec succès.` });
+    } catch (err) {
+      setSecurityBanner({ type: 'CHANNEL_ERROR', text: err.message });
     }
   };
 
@@ -812,9 +1183,9 @@ export default function App() {
           <p className="text-slate-300 text-sm mb-6 leading-relaxed">{revokedLockdown}</p>
           <div className="bg-slate-950/90 border border-red-800/60 rounded-xl p-4 text-left text-xs text-slate-300 space-y-2 mb-6 font-mono">
             <div>✓ Connexion WebSocket temps réel coupée par le serveur souverain (Code 4003)</div>
-            <div>✓ Jeton JWT invalidé sur l’ensemble des appareils (Token Version incrémentée)</div>
-            <div>✓ Signal REMOTE_WIPE exécuté : clés privées E2EE effacées du stockage local</div>
-            <div>✓ Rotation de l’époque cryptographique (crypto_epoch) sur tous les groupes</div>
+            <div>✓ Jeton JWT invalidé côté serveur (Token Version incrémentée — bloque aussi tout terminal hors-ligne)</div>
+            <div>✓ Signal REMOTE_WIPE exécuté sur ce navigateur : clés privées E2EE et IndexedDB purgées</div>
+            <div>✓ Rotation de l’époque cryptographique (crypto_epoch) avec nouveau secret CSPRNG excluant cet agent</div>
           </div>
           <button
             onClick={() => {
@@ -833,6 +1204,71 @@ export default function App() {
   // ============================================================================
   // ÉCRAN DE CONNEXION VÉRIFIÉE (ENRÔLEMENT + 2FA TOTP + SIMULATEUR D'INTRUS)
   // ============================================================================
+  if (passwordChangeToken && passwordChangeAgent) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center px-4 py-8">
+        <section className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
+          <div className="mb-5 flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-600/20 text-emerald-400">
+              <Lock className="h-5 w-5" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-white">Choisissez votre mot de passe</h1>
+              <p className="text-sm text-slate-400">Première connexion de {passwordChangeAgent.full_name}</p>
+            </div>
+          </div>
+
+          <p className="mb-5 text-sm text-slate-400">
+            Pour protéger votre compte, remplacez le mot de passe temporaire avant de continuer.
+          </p>
+
+          {authAlert && (
+            <div className="mb-4 rounded-xl border border-red-300 bg-red-50 p-3 text-sm text-red-800" role="alert">
+              {authAlert.message}
+            </div>
+          )}
+
+          <form onSubmit={handleFirstPasswordChange} className="space-y-4">
+            <label className="block text-sm font-medium text-slate-300">
+              Nouveau mot de passe
+              <input
+                type="password"
+                autoComplete="new-password"
+                minLength={12}
+                maxLength={72}
+                required
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-3 text-sm text-white focus:border-emerald-500 focus:outline-none"
+              />
+            </label>
+            <p className="-mt-2 text-xs text-slate-500">12 caractères minimum, avec une majuscule, une minuscule et un chiffre.</p>
+            <label className="block text-sm font-medium text-slate-300">
+              Confirmer le nouveau mot de passe
+              <input
+                type="password"
+                autoComplete="new-password"
+                minLength={12}
+                maxLength={72}
+                required
+                value={confirmNewPassword}
+                onChange={(e) => setConfirmNewPassword(e.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-3 text-sm text-white focus:border-emerald-500 focus:outline-none"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={isChangingPassword}
+              className="w-full rounded-xl bg-emerald-700 px-4 py-3 text-sm font-bold text-white hover:bg-emerald-600 disabled:opacity-60"
+            >
+              {isChangingPassword ? 'Enregistrement…' : 'Enregistrer et continuer'}
+            </button>
+          </form>
+        </section>
+      </div>
+    );
+  }
+
   if (!token || !currentAgent) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between">
@@ -875,7 +1311,7 @@ export default function App() {
             </div>
 
             <p className="text-xs text-slate-400 mb-6 border-l-2 border-emerald-500 pl-3">
-              {t.appSubtitle} — <em>« {t.motto} »</em>
+              {t.appSubtitle}
             </p>
 
             {authAlert && (
@@ -889,17 +1325,18 @@ export default function App() {
                 <div className="font-bold flex items-center gap-2 mb-1">
                   <ShieldAlert className="w-4 h-4 shrink-0" />
                   {authAlert.type === 'intruder_blocked'
-                    ? `ÉPREUVE JURY « INTRUS » VALIDÉE (HTTP ${authAlert.status} FORBIDDEN)`
-                    : 'ACCÈS REFUSÉ PAR LE CONTRÔLE SOUVERAIN'}
+                    ? 'Accès refusé : identifiant inconnu.'
+                    : 'Connexion impossible'}
                 </div>
                 <div>{authAlert.message}</div>
               </div>
             )}
 
+            {authMode === 'login' ? (
             <form onSubmit={handleLoginSubmit} className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-300 mb-1">
-                  Matricule Officiel (Agent préalablement enrôlé DGTD)
+                  Identifiant professionnel
                 </label>
                 <input
                   type="text"
@@ -913,7 +1350,7 @@ export default function App() {
 
               <div>
                 <label className="block text-xs font-semibold text-slate-300 mb-1">
-                  Mot de passe de service
+                  Mot de passe
                 </label>
                 <input
                   type="password"
@@ -928,9 +1365,9 @@ export default function App() {
                 <div className="flex items-center justify-between mb-1">
                   <label className="text-xs font-semibold text-amber-400 flex items-center gap-1.5">
                     <KeyRound className="w-3.5 h-3.5" />
-                    Second Facteur Obligatoire — Code 2FA TOTP (RFC 6238)
+                    Code de sécurité
                   </label>
-                  <span className="text-[11px] text-slate-400">Renouvelé toutes les 30s</span>
+                  <span className="text-[11px] text-slate-400">6 chiffres</span>
                 </div>
                 <input
                   type="text"
@@ -950,45 +1387,136 @@ export default function App() {
               >
                 <Lock className="w-4 h-4" />
                 {isLoggingIn
-                  ? 'Vérification 2FA & Initialisation E2EE...'
-                  : 'Se connecter avec Authentification Forte (2FA)'}
+                  ? 'Connexion en cours…'
+                  : 'Se connecter'}
               </button>
             </form>
-
-            {/* Bouton de test direct de l'épreuve Jury "Intrus" */}
-            <div className="mt-6 pt-5 border-t border-slate-800">
-              <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2">
-                Épreuve en direct du Jury : Rejet d’un compte non enrôlé
+            ) : (
+              <div className="space-y-4">
+                {!activationToken ? (
+                  <form onSubmit={handleActivationStart} className="space-y-4">
+                    <p className="text-xs text-slate-300 rounded-lg border border-emerald-800 bg-emerald-950/30 p-3">
+                      Utilisez le matricule et le code à usage unique remis par votre administration. Le code expire après 24 heures.
+                    </p>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-300 mb-1">Identifiant professionnel</label>
+                      <input
+                        type="text"
+                        value={loginMatricule}
+                        onChange={(e) => setLoginMatricule(e.target.value)}
+                        required
+                        autoComplete="username"
+                        className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm font-mono text-white focus:border-emerald-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-300 mb-1">Code d’activation à usage unique</label>
+                      <input
+                        type="password"
+                        value={activationCode}
+                        onChange={(e) => setActivationCode(e.target.value)}
+                        required
+                        autoComplete="one-time-code"
+                        className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm font-mono text-white focus:border-emerald-500 focus:outline-none"
+                      />
+                    </div>
+                    <button type="submit" disabled={isLoggingIn} className="w-full py-3 rounded-xl bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white font-bold text-sm">
+                      {isLoggingIn ? 'Vérification…' : 'Vérifier mon invitation'}
+                    </button>
+                  </form>
+                ) : (
+                  <form onSubmit={handleActivationComplete} className="space-y-4">
+                    <div className="rounded-xl border border-amber-700 bg-amber-950/30 p-3 text-xs text-amber-100">
+                      <div className="font-bold mb-1">1. Configurez votre application d’authentification</div>
+                      <p className="mb-2">Ajoutez un compte TOTP dans l’application approuvée par votre administration, puis saisissez cette clé. Elle ne sera plus affichée après l’activation.</p>
+                      <code className="block select-all break-all rounded-lg bg-slate-950 p-3 font-mono tracking-wider text-amber-300">{activationTotpSecret}</code>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-300 mb-1">Code à 6 chiffres de l’application</label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        pattern="[0-9]{6}"
+                        value={activationTotpCode}
+                        onChange={(e) => setActivationTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                        required
+                        autoComplete="one-time-code"
+                        maxLength={6}
+                        className="w-full bg-slate-950 border border-amber-500/60 rounded-xl px-3.5 py-2.5 text-base font-mono tracking-widest text-amber-300 focus:border-amber-400 focus:outline-none"
+                        placeholder="000000"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-300 mb-1">Choisissez votre mot de passe</label>
+                      <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} required minLength={12} autoComplete="new-password" className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white focus:border-emerald-500 focus:outline-none" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-300 mb-1">Confirmez le mot de passe</label>
+                      <input type="password" value={confirmNewPassword} onChange={(e) => setConfirmNewPassword(e.target.value)} required minLength={12} autoComplete="new-password" className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white focus:border-emerald-500 focus:outline-none" />
+                    </div>
+                    <button type="submit" disabled={isChangingPassword || activationTotpCode.length !== 6} className="w-full py-3 rounded-xl bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white font-bold text-sm">
+                      {isChangingPassword ? 'Activation…' : 'Activer mon compte'}
+                    </button>
+                  </form>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('login');
+                    setActivationCode('');
+                    setActivationToken('');
+                    setActivationTotpSecret('');
+                    setActivationTotpCode('');
+                    setAuthAlert(null);
+                  }}
+                  className="w-full py-2 text-xs text-slate-400 hover:text-white"
+                >
+                  Retour à la connexion
+                </button>
               </div>
+            )}
+
+            {authMode === 'login' && (
               <button
                 type="button"
-                onClick={handleSimulateIntruderAttempt}
-                className="w-full py-2.5 px-4 rounded-xl bg-red-950/60 hover:bg-red-900/60 border border-red-700/70 text-red-200 text-xs font-semibold flex items-center justify-center gap-2 transition"
+                onClick={() => { setAuthMode('activate'); setAuthAlert(null); }}
+                className="mt-4 w-full py-2.5 rounded-xl border border-slate-700 hover:border-emerald-600 text-emerald-300 text-sm font-semibold"
               >
-                <UserX className="w-4 h-4 text-red-400" />
-                {t.intruderTestBtn}
+                Activer mon compte avec un code d’invitation
               </button>
-            </div>
+            )}
+
+            {demoAccounts.length > 0 && (
+              <details className="mt-6 border-t border-slate-800 pt-4 text-sm">
+                <summary className="cursor-pointer text-slate-500">Outils de démonstration</summary>
+                <button
+                  type="button"
+                  onClick={handleSimulateIntruderAttempt}
+                  className="mt-3 w-full py-2.5 px-4 rounded-xl bg-red-950/60 hover:bg-red-900/60 border border-red-700/70 text-red-200 text-xs font-semibold flex items-center justify-center gap-2 transition"
+                >
+                  <UserX className="w-4 h-4 text-red-400" />
+                  Tester un identifiant inconnu
+                </button>
+              </details>
+            )}
           </div>
 
-          {/* Colonne droite : Jeu de comptes de démonstration fictifs pour le jury */}
+          {demoAccounts.length > 0 && (
           <div className="lg:col-span-6 bg-slate-900/70 border border-slate-800 rounded-2xl p-6">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-sm font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-2">
                 <Users className="w-4 h-4" />
-                Comptes Fictifs de Démonstration (Accès 1-Clic Jury)
+                Comptes de démonstration
               </h2>
               <button
                 onClick={fetchDemoAccounts}
                 className="text-xs text-slate-400 hover:text-white flex items-center gap-1"
               >
-                <RefreshCw className="w-3.5 h-3.5" /> Actualiser 2FA
+                <RefreshCw className="w-3.5 h-3.5" /> Actualiser
               </button>
             </div>
             <p className="text-xs text-slate-400 mb-4 leading-relaxed">
-              Cliquez sur un agent fictif ci-dessous pour pré-remplir son matricule, son mot de passe et son
-              code <strong>2FA TOTP RFC 6238</strong> en direct. Ouvrez deux fenêtres côte à côte pour tester
-              le chiffrement E2EE et la révocation en direct.
+              Choisissez un compte pour remplir automatiquement le formulaire de connexion.
             </p>
 
             <div className="space-y-2.5">
@@ -1015,32 +1543,27 @@ export default function App() {
                       </span>
                     ) : (
                       <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-700/50">
-                        2FA TOTP: {acc.current_totp_code}
+                        Compte disponible
                       </span>
                     )}
                   </div>
                   <div className="text-xs text-slate-400 mt-1 flex items-center justify-between">
                     <span>{acc.ministry}</span>
-                    <span className="text-[11px] text-slate-500">{acc.role}</span>
                   </div>
                 </div>
               ))}
             </div>
 
-            <div className="mt-5 p-4 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-400 space-y-1.5">
-              <div className="font-semibold text-slate-200 flex items-center gap-1.5">
-                <Shield className="w-4 h-4 text-emerald-400" />
-                Socle de Sécurité Souverain Actif :
-              </div>
-              <div>• Protocole E2EE : Protocole de session de groupe inspiré de Signal/Megolm via W3C WebCrypto (ECDH P-256 / HKDF-SHA256 / AES-256-GCM / ECDSA)</div>
-              <div>• Second Facteur : TOTP RFC 6238 via PyCA Cryptography (Secret chiffré au repos via Fernet AES-128-CBC + HMAC)</div>
-              <div>• Langues nationales intégrées : Français, Mooré, Dioula, Fulfulde + Notes vocales E2EE</div>
-            </div>
+            <details className="mt-5 rounded-xl border border-slate-800 bg-slate-950 p-4 text-xs text-slate-400">
+              <summary className="cursor-pointer font-semibold text-slate-200">Comment vos messages sont protégés</summary>
+              <p className="mt-3">Seuls les membres autorisés peuvent lire les messages. La connexion est protégée par un mot de passe et un code de sécurité.</p>
+            </details>
           </div>
+          )}
         </div>
 
         <footer className="text-center py-4 text-xs text-slate-500 border-t border-slate-900">
-          FASO-SÉCUR • Sprint Technique Pré-Hackathon 226 (Semaine du Numérique 2026) • Licence Open Source MIT
+          FASO-SÉCUR • Sprint Technique Pré-Hackathon 226 (Semaine du Numérique 2026) • Distribution GPL-3.0-only
         </footer>
       </div>
     );
@@ -1066,9 +1589,6 @@ export default function App() {
           <div>
             <div className="flex items-center gap-2">
               <span className="font-extrabold text-base tracking-tight text-white">{t.appTitle}</span>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-700">
-                {t.e2eeActive}
-              </span>
               <span
                 className={`text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1 ${
                   wsConnected
@@ -1077,7 +1597,7 @@ export default function App() {
                 }`}
               >
                 {wsConnected ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
-                {wsConnected ? 'Relais Temps Réel Actif' : 'Mode Hors-Ligne / Relais'}
+                {wsConnected ? 'En ligne' : 'Connexion interrompue'}
               </span>
             </div>
             <div className="text-[11px] text-slate-400">
@@ -1105,31 +1625,27 @@ export default function App() {
             </select>
           </div>
 
-          {/* Mode Dégradé Faible Connexion */}
-          <button
-            onClick={() => setLowBandwidthMode((v) => !v)}
-            className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition ${
-              lowBandwidthMode
-                ? 'bg-amber-950 border-amber-500 text-amber-200'
-                : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
-            }`}
-            title={t.lowBandwidthMode}
-          >
-            <WifiOff className="w-3.5 h-3.5" />
-            <span className="hidden xl:inline">{t.lowBandwidthMode}</span>
-          </button>
+          <details className="relative">
+            <summary className="list-none cursor-pointer px-2.5 py-1.5 rounded-lg border border-slate-700 text-slate-300 text-xs">Plus</summary>
+            <div className="absolute right-0 top-full z-30 mt-2 w-56 rounded-xl border border-slate-700 bg-white p-2 shadow-xl">
+              <button
+                onClick={() => setLowBandwidthMode((v) => !v)}
+                className="w-full rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100"
+                title={t.lowBandwidthMode}
+              >
+                <WifiOff className="mr-2 inline h-3.5 w-3.5" />
+                {lowBandwidthMode ? 'Désactiver la connexion lente' : 'Activer la connexion lente'}
+              </button>
+              <button
+                onClick={handlePanicWipe}
+                className="w-full rounded-lg px-3 py-2 text-left text-xs text-red-700 hover:bg-red-50"
+                title={t.panicButton}
+              >
+                <Trash2 className="mr-2 inline h-3.5 w-3.5" />{t.panicButton}
+              </button>
+            </div>
+          </details>
 
-          {/* Bouton d'urgence Panic Wipe */}
-          <button
-            onClick={handlePanicWipe}
-            className="px-2.5 py-1.5 rounded-lg bg-red-950/80 hover:bg-red-900 border border-red-600 text-red-200 text-xs font-semibold flex items-center gap-1.5 transition"
-            title={t.panicButton}
-          >
-            <Trash2 className="w-3.5 h-3.5 text-red-400" />
-            <span className="hidden md:inline">{t.panicButton}</span>
-          </button>
-
-          {/* Déconnexion */}
           <button
             onClick={handleLogout}
             className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs flex items-center gap-1"
@@ -1182,7 +1698,7 @@ export default function App() {
           {t.directoryTab}
         </button>
 
-        <button
+        {canManageAccounts && <button
           onClick={() => setActiveTab('admin')}
           className={`py-2.5 px-3.5 text-xs font-bold border-b-2 flex items-center gap-2 transition whitespace-nowrap ${
             activeTab === 'admin'
@@ -1191,10 +1707,10 @@ export default function App() {
           }`}
         >
           <UserX className="w-3.5 h-3.5" />
-          {t.adminRevokeTab} (Épreuve Révocation)
-        </button>
+          {t.adminRevokeTab}
+        </button>}
 
-        <button
+        {canInspectSecurity && <button
           onClick={() => setActiveTab('inspector')}
           className={`py-2.5 px-3.5 text-xs font-bold border-b-2 flex items-center gap-2 transition whitespace-nowrap ${
             activeTab === 'inspector'
@@ -1203,8 +1719,8 @@ export default function App() {
           }`}
         >
           <Database className="w-3.5 h-3.5" />
-          {t.juryInspectorTab} (« Le serveur ne lit rien »)
-        </button>
+          {t.juryInspectorTab}
+        </button>}
       </div>
 
       {/* ==================================================================== */}
@@ -1215,12 +1731,27 @@ export default function App() {
           {/* Liste des canaux institutionnels */}
           <aside className="w-72 bg-slate-900/80 border-r border-slate-800 flex flex-col shrink-0">
             <div className="p-3 border-b border-slate-800 flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                Salons Chiffrés E2EE
-              </span>
-              <span className="text-[10px] font-mono bg-slate-800 px-2 py-0.5 rounded text-emerald-400">
-                WebCrypto E2EE
-              </span>
+              <span className="text-sm font-semibold text-slate-200">Conversations</span>
+              {canManageAccounts && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNewChannelForm({
+                      name: '',
+                      ministry_scope: currentAgent?.role === 'SUPER_ADMIN_DGTD' ? 'TOUS' : currentAgent?.ministry || 'TOUS',
+                      channel_type: 'GROUP',
+                      default_classification: 'DIFFUSION_RESTREINTE',
+                      member_ids: [],
+                    });
+                    setShowNewChannelModal(true);
+                  }}
+                  className="px-2 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] font-bold flex items-center gap-1 shadow transition"
+                  title="Créer un nouveau salon ministériel ou interministériel"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Nouveau
+                </button>
+              )}
             </div>
 
             <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
@@ -1236,30 +1767,22 @@ export default function App() {
                 >
                   <div className="flex items-center justify-between gap-1 mb-1">
                     <span className="font-semibold text-xs truncate">{ch.name}</span>
-                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-amber-300 shrink-0">
-                      Epoch #{ch.crypto_epoch}
-                    </span>
                   </div>
                   <div className="flex items-center justify-between text-[10px] text-slate-400">
-                    <span>{ch.default_classification}</span>
-                    <span>{ch.active_members?.length || 0} agents habilités</span>
+                    <span>{ch.default_classification === 'ORDINAIRE' ? 'Standard' : ch.default_classification === 'DIFFUSION_RESTREINTE' ? 'Restreint' : 'Confidentiel'}</span>
+                    <span>{ch.active_members?.length || 0} membres</span>
                   </div>
                 </button>
               ))}
             </div>
 
             {/* Empreinte cryptographique locale de l'agent (Numéro de Sécurité 30 chiffres) */}
-            <div className="p-3 border-t border-slate-800 bg-slate-950/80 text-[11px] text-slate-400 space-y-1">
-              <div className="font-semibold text-emerald-400 flex items-center gap-1">
-                <KeyRound className="w-3.5 h-3.5" />
-                Trousseau Local E2EE Actif
-              </div>
-              <div className="font-mono text-[10px] text-amber-300" title="Numéro de sécurité (Safety Number) SHA-256 à 30 chiffres vérifiable hors-bande">
-                Empreinte: {keystore?.safetyNumber || 'Calcul en cours...'}
-              </div>
-              <div className="text-[10px] text-slate-500">
-                Clé privée chiffrée en session exclusivement dans ce navigateur.
-              </div>
+            <div className="p-3 border-t border-slate-200 text-xs text-slate-600">
+              <details>
+                <summary className="cursor-pointer">Détails de sécurité</summary>
+                <p className="mt-2 break-all font-mono text-[10px]">Empreinte : {keystore?.safetyNumber || 'Calcul en cours…'}</p>
+                <p className="mt-1">Vos clés restent sur cet appareil.</p>
+              </details>
             </div>
           </aside>
 
@@ -1271,26 +1794,12 @@ export default function App() {
                 <div>
                   <div className="flex items-center gap-2">
                     <h2 className="font-bold text-sm text-white">{currentChannel.name}</h2>
-                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-700/60">
-                      Session de Groupe Epoch #{currentChannel.crypto_epoch}
-                    </span>
                   </div>
                   <div className="text-xs text-slate-400 mt-0.5">
-                    {t.zeroKnowledge} • Membres actifs :{' '}
-                    {currentChannel.active_members?.map((m) => m.matricule).join(', ')}
+                    {currentChannel.active_members?.length || 0} membres • Messages réservés aux membres de cette conversation
                   </div>
                 </div>
 
-                {/* Raccourci rapide pour tester la révocation pendant la conversation */}
-                {(currentAgent.role === 'SUPER_ADMIN_DGTD' || currentAgent.role === 'POINT_FOCAL') && (
-                  <button
-                    onClick={() => setActiveTab('admin')}
-                    className="px-3 py-1.5 rounded-lg bg-red-950/70 hover:bg-red-900 border border-red-600/70 text-red-200 text-xs font-semibold flex items-center gap-1.5"
-                  >
-                    <UserX className="w-3.5 h-3.5 text-red-400" />
-                    Révoquer un membre en direct
-                  </button>
-                )}
               </div>
             )}
 
@@ -1298,7 +1807,7 @@ export default function App() {
             <div className="flex-1 overflow-y-auto p-5 space-y-4">
               {messages.length === 0 ? (
                 <div className="text-center py-12 text-slate-500 text-sm">
-                  Aucun message dans ce salon. Envoyez une instruction chiffrée de bout en bout ci-dessous.
+                  Aucun message pour le moment. Écrivez votre premier message ci-dessous.
                 </div>
               ) : (
                 messages.map((msg) => {
@@ -1320,7 +1829,8 @@ export default function App() {
                   const isMine = senderMatricule === currentAgent.matricule;
                   const isConfidentiel = msgClassification === 'CONFIDENTIEL';
                   const isRestreint = msgClassification === 'DIFFUSION_RESTREINTE';
-                  const isSignatureValid = dec?.signatureVerified || msg.ecdsa_verified_by_server;
+                  const isSignatureValid = Boolean(dec?.decryptedOk && dec?.signatureVerified);
+                  const isSignatureForgedOrUnverified = Boolean(dec?.decryptedOk && !dec?.signatureVerified);
                   const hasSignedReceipt = msg.probative_receipts?.some(
                     (r) => r.agent_matricule === currentAgent.matricule
                   );
@@ -1351,15 +1861,15 @@ export default function App() {
                       <div className="flex flex-wrap items-center justify-between gap-2 mb-2 relative z-10">
                         <div className="flex items-center gap-2">
                           <span className="font-bold text-xs text-white">{senderName}</span>
-                          <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-amber-300">
-                            {senderMatricule}
-                          </span>
-                          <span className="text-[10px] text-slate-400">
-                            Epoch #{msg.crypto_epoch}
-                          </span>
+                          {isMine && <span className="text-[10px] text-slate-500">Vous</span>}
                           {isSignatureValid && (
-                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-700/50">
-                              ✓ ECDSA-P256 Vérifié
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200">
+                              ✓ Identité confirmée
+                            </span>
+                          )}
+                          {isSignatureForgedOrUnverified && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-50 text-red-800 border border-red-200">
+                              ⚠ Identité à vérifier
                             </span>
                           )}
                         </div>
@@ -1374,7 +1884,7 @@ export default function App() {
                                 : 'bg-slate-800 text-emerald-300 border-slate-700'
                             }`}
                           >
-                            {msgClassification}
+                            {msgClassification === 'ORDINAIRE' ? 'Standard' : msgClassification === 'DIFFUSION_RESTREINTE' ? 'Restreint' : 'Confidentiel'}
                           </span>
                           {msg.expires_at && (
                             <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-red-950/80 text-red-300">
@@ -1497,13 +2007,6 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* Aperçu du Ciphertext stocké côté serveur (preuve E2EE immédiate) */}
-                      <div className="mt-2 pt-1.5 border-t border-slate-800/40 flex items-center justify-between text-[10px] font-mono text-slate-500">
-                        <span>Pseudonyme BDD: {msg.sender_pseudonym_hash}</span>
-                        <span className="truncate max-w-xs">
-                          Ciphertext: {msg.ciphertext_payload.slice(0, 28)}...
-                        </span>
-                      </div>
                     </div>
                   );
                 })
@@ -1515,8 +2018,9 @@ export default function App() {
               onSubmit={handleSendEncryptedText}
               className="p-3.5 bg-slate-900 border-t border-slate-800 space-y-2.5 shrink-0"
             >
-              {/* Options de classification, expiration et valeur probante */}
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <details className="text-xs">
+                <summary className="w-fit cursor-pointer text-slate-500">Options du message · {classification === 'ORDINAIRE' ? 'Standard' : classification === 'DIFFUSION_RESTREINTE' ? 'Restreint' : 'Confidentiel'}</summary>
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-slate-400 font-medium">{t.classificationLabel}</span>
                   {['ORDINAIRE', 'DIFFUSION_RESTREINTE', 'CONFIDENTIEL'].map((lvl) => (
@@ -1534,9 +2038,21 @@ export default function App() {
                           : 'bg-slate-950 text-slate-400 border-slate-800'
                       }`}
                     >
-                      {lvl.replace('_', ' ')}
+                      {lvl === 'ORDINAIRE' ? 'Standard' : lvl === 'DIFFUSION_RESTREINTE' ? 'Restreint' : 'Confidentiel'}
                     </button>
                   ))}
+
+                  <select
+                    value={voiceNoteLang}
+                    onChange={(e) => setVoiceNoteLang(e.target.value)}
+                    aria-label="Langue du message vocal"
+                    className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[11px] text-slate-300"
+                  >
+                    <option value="Mooré">Voix : Mooré</option>
+                    <option value="Dioula">Voix : Dioula</option>
+                    <option value="Fulfulde">Voix : Fulfulde</option>
+                    <option value="Français">Voix : Français</option>
+                  </select>
 
                   <select
                     value={expiresInSeconds}
@@ -1560,6 +2076,7 @@ export default function App() {
                   {t.requireProbativeReceipt}
                 </label>
               </div>
+              </details>
 
               {/* Barre de saisie + Note vocale E2EE en langue nationale + Fichier E2EE */}
               <div className="flex items-center gap-2">
@@ -1578,33 +2095,20 @@ export default function App() {
                   <Paperclip className="w-4 h-4" />
                 </button>
 
-                {/* Sélecteur de langue pour la note vocale + Enregistreur vocal E2EE */}
-                <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-1">
-                  <select
-                    value={voiceNoteLang}
-                    onChange={(e) => setVoiceNoteLang(e.target.value)}
-                    className="bg-transparent text-[11px] text-amber-300 px-1.5 focus:outline-none"
-                  >
-                    <option value="Mooré" className="bg-slate-900">Voix: Mooré</option>
-                    <option value="Dioula" className="bg-slate-900">Voix: Dioula</option>
-                    <option value="Fulfulde" className="bg-slate-900">Voix: Fulfulde</option>
-                    <option value="Français" className="bg-slate-900">Voix: Français</option>
-                  </select>
-                  <button
-                    type="button"
-                    onClick={handleToggleVoiceRecording}
-                    className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition ${
-                      isRecordingVoice
-                        ? 'bg-red-600 text-white animate-pulse'
-                        : 'bg-slate-800 hover:bg-slate-700 text-emerald-300'
-                    }`}
-                  >
-                    {isRecordingVoice ? <Square className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-                    <span className="hidden md:inline">
-                      {isRecordingVoice ? t.stopAndSendVoice : t.recordVoice}
-                    </span>
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  onClick={handleToggleVoiceRecording}
+                  title={isRecordingVoice ? t.stopAndSendVoice : t.recordVoice}
+                  aria-label={isRecordingVoice ? t.stopAndSendVoice : t.recordVoice}
+                  className={`px-2.5 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition ${
+                    isRecordingVoice
+                      ? 'bg-red-600 text-white animate-pulse'
+                      : 'bg-slate-800 hover:bg-slate-700 text-emerald-300'
+                  }`}
+                >
+                  {isRecordingVoice ? <Square className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                  <span>{isRecordingVoice ? 'Arrêter' : 'Vocal'}</span>
+                </button>
 
                 <input
                   type="text"
@@ -1709,7 +2213,7 @@ export default function App() {
       {/* ==================================================================== */}
       {/* ONGLET 3 : ADMINISTRATION DGTD & ÉPREUVE DE RÉVOCATION EN DIRECT     */}
       {/* ==================================================================== */}
-      {activeTab === 'admin' && (
+      {canManageAccounts && activeTab === 'admin' && (
         <div className="flex-1 overflow-y-auto p-6 max-w-6xl w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* Liste de révocation en direct */}
           <div className="lg:col-span-7 space-y-4">
@@ -1745,11 +2249,51 @@ export default function App() {
                             RÉVOQUÉ
                           </span>
                         )}
+                        {!ag.is_enrolled_activated && !ag.is_revoked && (
+                          <span className="text-[10px] bg-amber-700/70 text-amber-100 px-2 py-0.5 rounded font-bold">INVITATION EN ATTENTE</span>
+                        )}
                       </div>
                       <div className="text-xs text-slate-400">{ag.ministry}</div>
+                      <div className="mt-2 flex items-center gap-2 text-xs text-slate-500">
+                        <span>Rôle : {ag.role}</span>
+                        {currentAgent.role === 'SUPER_ADMIN_DGTD' && (
+                          <>
+                            <select
+                              aria-label={`Rôle de ${ag.full_name}`}
+                              disabled={ag.id === currentAgent.id}
+                              value={roleDrafts[ag.id] || ag.role}
+                              onChange={(e) => setRoleDrafts((prev) => ({ ...prev, [ag.id]: e.target.value }))}
+                              className="rounded border border-slate-700 bg-white px-2 py-1 text-slate-800 disabled:opacity-50"
+                            >
+                              <option value="AGENT_PUBLIC">Agent public</option>
+                              <option value="POINT_FOCAL">Point focal</option>
+                              <option value="AUDITEUR">Auditeur</option>
+                              <option value="SUPER_ADMIN_DGTD">Administrateur DGTD</option>
+                            </select>
+                            {roleDrafts[ag.id] && roleDrafts[ag.id] !== ag.role && (
+                              <button
+                                type="button"
+                                onClick={() => handleChangeAgentRole(ag)}
+                                className="rounded bg-emerald-700 px-2 py-1 text-white hover:bg-emerald-600"
+                              >
+                                Appliquer
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
                     </div>
 
                     <div className="flex items-center gap-2">
+                      {!ag.is_enrolled_activated && !ag.is_revoked && (
+                        <button
+                          type="button"
+                          onClick={() => handleReissueActivationCode(ag)}
+                          className="px-3 py-1.5 rounded-lg bg-amber-700 hover:bg-amber-600 text-white text-xs font-bold"
+                        >
+                          Réémettre le code
+                        </button>
+                      )}
                       {!ag.is_revoked ? (
                         <button
                           onClick={() => handleRevokeAgent(ag)}
@@ -1783,7 +2327,7 @@ export default function App() {
                 Enrôler un Nouvel Agent Public (DGTD)
               </h2>
               <p className="text-xs text-slate-400 mb-4">
-                Seuls les agents enrôlés ici reçoivent un secret 2FA TOTP RFC 6238 et peuvent rejoindre FASO-SÉCUR.
+                  L’agent reçoit un code d’activation à usage unique, puis choisit lui-même son mot de passe et configure son 2FA.
               </p>
 
               <form onSubmit={handleEnrolNewAgent} className="space-y-3 text-xs">
@@ -1827,25 +2371,40 @@ export default function App() {
                     required
                   />
                 </div>
+                {currentAgent.role === 'SUPER_ADMIN_DGTD' && (
+                  <div>
+                    <label className="block text-slate-300 mb-1">Rôle attribué</label>
+                    <select
+                      value={newAgentForm.role}
+                      onChange={(e) => setNewAgentForm({ ...newAgentForm, role: e.target.value })}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                    >
+                      <option value="AGENT_PUBLIC">Agent public</option>
+                      <option value="POINT_FOCAL">Point focal</option>
+                      <option value="AUDITEUR">Auditeur (lecture seule)</option>
+                      <option value="SUPER_ADMIN_DGTD">Administrateur DGTD</option>
+                    </select>
+                    <p className="mt-1 text-[11px] text-slate-500">Les rôles privilégiés ne sont attribuables que par la DGTD.</p>
+                  </div>
+                )}
                 <button
                   type="submit"
                   className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold"
                 >
-                  Enrôler l’agent & Générer son secret 2FA TOTP
+                  Créer le compte & Générer le code d’activation
                 </button>
               </form>
 
               {enrolmentResult && (
                 <div className="mt-4 p-3.5 rounded-xl bg-emerald-950/60 border border-emerald-500 text-xs space-y-1">
                   <div className="font-bold text-emerald-300">
-                    ✓ Agent {enrolmentResult.matricule} enrôlé avec succès !
+                    ✓ Invitation créée pour {enrolmentResult.matricule}
                   </div>
-                  <div className="font-mono text-[11px] text-amber-300">
-                    Secret TOTP Base32 : {enrolmentResult.totp_secret}
+                  <div className="text-emerald-100">Remettez uniquement ce code à l’agent par un canal institutionnel sûr. Il expire le {new Date(enrolmentResult.activation_expires_at).toLocaleString()}.</div>
+                  <div className="select-all break-all rounded-lg border border-emerald-700 bg-slate-950 p-3 font-mono text-sm text-amber-300">
+                    {enrolmentResult.activation_code_once}
                   </div>
-                  <div className="font-mono text-[11px] text-white">
-                    Code 2FA TOTP actuel : {enrolmentResult.current_totp_code}
-                  </div>
+                  <div className="text-[11px] text-slate-300">Ce code ne s’affichera plus après fermeture de cette fiche. Il ne contient ni mot de passe ni secret TOTP.</div>
                 </div>
               )}
             </div>
@@ -1856,7 +2415,7 @@ export default function App() {
       {/* ==================================================================== */}
       {/* ONGLET 4 : INSPECTEUR JURY (« LE SERVEUR NE LIT RIEN »)              */}
       {/* ==================================================================== */}
-      {activeTab === 'inspector' && (
+      {canInspectSecurity && activeTab === 'inspector' && (
         <div className="flex-1 overflow-y-auto p-6 max-w-6xl w-full mx-auto space-y-6">
           <div className="bg-slate-900 border border-cyan-500/50 rounded-2xl p-5">
             <div className="flex items-center justify-between mb-3">
@@ -1891,14 +2450,14 @@ export default function App() {
                   <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                     <div className="text-slate-400">Colonnes en clair (vérifiées dynamiquement)</div>
                     <div className="text-xl font-extrabold text-emerald-400 mt-1">
-                      {inspectionData.plaintext_columns_in_db} (Zéro Texte Clair)
+                      {inspectionData.zero_knowledge_verification?.plaintext_columns_in_db ?? 0} (Zéro Texte Clair)
                     </div>
                   </div>
                   <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                     <div className="text-slate-400">Secrets 2FA TOTP en BDD</div>
                     <div className="text-sm font-bold text-amber-300 mt-1">
-                      {inspectionData.all_totp_secrets_encrypted_at_rest
-                        ? '100% Chiffrés au repos (Fernet AES-128)'
+                      {inspectionData.zero_knowledge_verification?.all_totp_secrets_fernet_encrypted_at_rest
+                        ? '100% Chiffrés au repos (Fernet AES-128-CBC + HMAC)'
                         : 'Vérification en cours'}
                     </div>
                   </div>
@@ -1922,6 +2481,18 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Trames réseau brutes WebSocket & Blobs chiffrés */}
+                <div>
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">
+                    Trames Réseau Brutes (`recent_network_wire_frames` — Zéro clair sur le fil)
+                  </h3>
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 overflow-x-auto max-h-48">
+                    <pre className="text-[11px] font-mono text-cyan-300">
+                      {JSON.stringify(inspectionData.recent_network_wire_frames, null, 2)}
+                    </pre>
+                  </div>
+                </div>
+
                 {/* Journal d'audit de sécurité (Intrus rejetés, révocations, 2FA) */}
                 <div>
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">
@@ -1935,6 +2506,115 @@ export default function App() {
                 </div>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Modal de création de canal */}
+      {showNewChannelModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                <Users className="w-5 h-5 text-emerald-400" />
+                Créer une nouvelle conversation E2EE
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShowNewChannelModal(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateChannel} className="space-y-3 text-xs">
+              <div>
+                <label className="block text-slate-300 mb-1 font-semibold">Nom du canal</label>
+                <input
+                  type="text"
+                  placeholder="Ex : Coordination Urgences CHU"
+                  value={newChannelForm.name}
+                  onChange={(e) => setNewChannelForm({ ...newChannelForm, name: e.target.value })}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-300 mb-1 font-semibold">Classification par défaut</label>
+                <select
+                  value={newChannelForm.default_classification}
+                  onChange={(e) => setNewChannelForm({ ...newChannelForm, default_classification: e.target.value })}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                >
+                  <option value="ORDINAIRE">ORDINAIRE (Diffusion large)</option>
+                  <option value="DIFFUSION_RESTREINTE">DIFFUSION RESTREINTE</option>
+                  <option value="CONFIDENTIEL">CONFIDENTIEL (Strictement protégé)</option>
+                </select>
+              </div>
+
+              {currentAgent?.role === 'SUPER_ADMIN_DGTD' && (
+                <div>
+                  <label className="block text-slate-300 mb-1 font-semibold">Portée du canal</label>
+                  <select
+                    value={newChannelForm.ministry_scope}
+                    onChange={(e) => setNewChannelForm({ ...newChannelForm, ministry_scope: e.target.value })}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                  >
+                    <option value="TOUS">Interministériel (Tous les ministères)</option>
+                    {Object.keys(directoryData.by_ministry || {}).map((min) => (
+                      <option key={min} value={min}>{min}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-slate-300 mb-1 font-semibold">
+                  Membres invités ({newChannelForm.member_ids.length} sélectionné(s))
+                </label>
+                <div className="max-h-36 overflow-y-auto space-y-1 bg-slate-950 border border-slate-800 rounded-lg p-2">
+                  {(directoryData.agents || [])
+                    .filter((ag) => !ag.is_revoked && ag.id !== currentAgent?.id)
+                    .filter((ag) => currentAgent?.role === 'SUPER_ADMIN_DGTD' || ag.ministry === currentAgent?.ministry)
+                    .map((ag) => (
+                      <label key={ag.id} className="flex items-center gap-2 p-1 rounded hover:bg-slate-900 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={newChannelForm.member_ids.includes(ag.id)}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setNewChannelForm((prev) => ({ ...prev, member_ids: [...prev.member_ids, ag.id] }));
+                            } else {
+                              setNewChannelForm((prev) => ({ ...prev, member_ids: prev.member_ids.filter((id) => id !== ag.id) }));
+                            }
+                          }}
+                        />
+                        <span className="font-mono text-amber-300 text-[11px]">{ag.matricule}</span>
+                        <span className="text-white text-xs truncate">{ag.full_name}</span>
+                        <span className="text-slate-400 text-[10px] ml-auto">({ag.ministry})</span>
+                      </label>
+                    ))}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowNewChannelModal(false)}
+                  className="px-3 py-1.5 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs"
+                >
+                  Annuler
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs"
+                >
+                  Créer le canal
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

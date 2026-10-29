@@ -5,17 +5,24 @@ services:
       dockerfile: Dockerfile
     container_name: faso-secur-backend
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8001}:8000"
     environment:
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/faso_secur_sovereign.db}
-      # Si non définis dans un fichier .env externe, le serveur génère des secrets CSPRNG 256 bits au démarrage (zéro secret statique codé en dur)
+      # Séparation physique stricte entre le volume de base de données (/app/data) et le coffre de secrets (/app/secrets)
+      - FASO_SECUR_SECRETS_FILE=${FASO_SECUR_SECRETS_FILE:-/app/secrets/.faso_secur_server_secrets.json}
+      # Support natif de Docker Secrets (*_FILE ou /run/secrets/...) et des variables d'environnement
       - FASO_SECUR_JWT_SECRET=${FASO_SECUR_JWT_SECRET:-}
+      - FASO_SECUR_JWT_SECRET_FILE=${FASO_SECUR_JWT_SECRET_FILE:-}
       - FASO_SECUR_METADATA_PEPPER=${FASO_SECUR_METADATA_PEPPER:-}
-      - FASO_SECUR_TOTP_ENCRYPTION_KEY=${FASO_SECUR_TOTP_ENCRYPTION_KEY:-}
-      - FASO_SECUR_DEMO_MODE=${FASO_SECUR_DEMO_MODE:-true}
-      - FASO_SECUR_CORS_ORIGINS=${FASO_SECUR_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://msg.gouv.bf}
+      - FASO_SECUR_METADATA_PEPPER_FILE=${FASO_SECUR_METADATA_PEPPER_FILE:-}
+      - FASO_SECUR_TOTP_FERNET_KEY=${FASO_SECUR_TOTP_FERNET_KEY:-}
+      - FASO_SECUR_TOTP_FERNET_KEY_FILE=${FASO_SECUR_TOTP_FERNET_KEY_FILE:-}
+      # Désactivé par défaut en production (activer via FASO_SECUR_DEMO_MODE=true pour la démo jury)
+      - FASO_SECUR_DEMO_MODE=${FASO_SECUR_DEMO_MODE:-false}
+      - FASO_SECUR_CORS_ORIGINS=${FASO_SECUR_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://localhost,https://msg.gouv.bf}
     volumes:
       - faso_secur_db_data:/app/data
+      - faso_secur_secrets_data:/app/secrets
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
       interval: 15s
@@ -41,3 +48,4 @@ services:
 
 volumes:
   faso_secur_db_data:
+  faso_secur_secrets_data:
