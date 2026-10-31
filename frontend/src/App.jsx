@@ -32,7 +32,18 @@ import {
   Wifi,
   WifiOff,
   X,
+  QrCode,
+  Camera,
+  ClipboardList,
+  CalendarClock,
+  ArrowRight,
+  Sun,
+  Moon,
+  ChevronRight,
+  Check,
 } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
+import { Html5Qrcode } from 'html5-qrcode';
 import {
   syncChannelGroupSecret,
   hasGroupSecret,
@@ -183,8 +194,12 @@ export default function App() {
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
   const [isChangingPassword, setIsChangingPassword] = useState(false);
 
-  // Navigation principale : 'chat' | 'directory' | 'admin' | 'inspector'
+  // Navigation principale : 'chat' | 'instructions' | 'directory' | 'admin' | 'inspector'
   const [activeTab, setActiveTab] = useState('chat');
+
+  // Scanner QR code d'activation
+  const [isQrScannerOpen, setIsQrScannerOpen] = useState(false);
+  const qrScannerRef = useRef(null);
 
   // Canaux & Messages déchiffrés localement
   const [channels, setChannels] = useState([]);
@@ -582,6 +597,59 @@ export default function App() {
       setIsLoggingIn(false);
     }
   };
+
+  // Scanner QR Code d'activation
+  useEffect(() => {
+    let scanner = null;
+    if (isQrScannerOpen) {
+      const container = document.getElementById('qr-reader-container');
+      if (container) {
+        scanner = new Html5Qrcode('qr-reader-container');
+        qrScannerRef.current = scanner;
+        scanner.start(
+          { facingMode: 'environment' },
+          { fps: 10, qrbox: { width: 220, height: 220 } },
+          (decodedText) => {
+            try {
+              let parsed = null;
+              if (decodedText.startsWith('{') && decodedText.endsWith('}')) {
+                parsed = JSON.parse(decodedText);
+              } else if (decodedText.includes('invitation=')) {
+                const params = new URLSearchParams(decodedText.split('?')[1]);
+                parsed = JSON.parse(atob(params.get('invitation') || ''));
+              }
+              if (parsed && (parsed.matricule || parsed.m) && (parsed.code || parsed.c)) {
+                setLoginMatricule((parsed.matricule || parsed.m).trim().toUpperCase());
+                setActivationCode((parsed.code || parsed.c).trim());
+                setIsQrScannerOpen(false);
+                setAuthAlert({ type: 'success', message: `QR Code scanné avec succès pour ${parsed.matricule || parsed.m}. Cliquez sur « Vérifier mon invitation » !` });
+              } else if (decodedText.includes(':')) {
+                const [mat, cod] = decodedText.split(':');
+                setLoginMatricule(mat.trim().toUpperCase());
+                setActivationCode(cod.trim());
+                setIsQrScannerOpen(false);
+                setAuthAlert({ type: 'success', message: `QR Code scanné pour ${mat.trim()}.` });
+              } else {
+                setActivationCode(decodedText.trim());
+                setIsQrScannerOpen(false);
+              }
+            } catch {
+              setActivationCode(decodedText.trim());
+              setIsQrScannerOpen(false);
+            }
+          },
+          () => {}
+        ).catch((err) => {
+          console.warn('QR Scanner caméra non disponible ou refusée:', err);
+        });
+      }
+    }
+    return () => {
+      if (scanner) {
+        scanner.stop().then(() => scanner.clear()).catch(() => {});
+      }
+    };
+  }, [isQrScannerOpen]);
 
   const handleActivationStart = async (e) => {
     e.preventDefault();
@@ -1390,14 +1458,50 @@ export default function App() {
                   ? 'Connexion en cours…'
                   : 'Se connecter'}
               </button>
+
+              {/* Bouton de simulation Intrus non enrôlé pour l'épreuve du Jury */}
+              <div className="pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={handleIntruderSimulation}
+                  disabled={isLoggingIn}
+                  className="w-full py-2 px-3 rounded-xl border border-red-800/80 bg-red-950/40 hover:bg-red-900/60 text-red-300 text-xs font-semibold flex items-center justify-center gap-2 transition"
+                  title="Simule une tentative d'accès par un individu non enrôlé (Épreuve Jury)"
+                >
+                  <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
+                  {t.intruderTestBtn || "Simuler l'attaque d'un Intrus (Épreuve Jury)"}
+                </button>
+              </div>
             </form>
             ) : (
               <div className="space-y-4">
                 {!activationToken ? (
                   <form onSubmit={handleActivationStart} className="space-y-4">
                     <p className="text-xs text-slate-300 rounded-lg border border-emerald-800 bg-emerald-950/30 p-3">
-                      Utilisez le matricule et le code à usage unique remis par votre administration. Le code expire après 24 heures.
+                      Utilisez le matricule et le code à usage unique remis par votre administration (ou scannez directement le QR code d'invitation).
                     </p>
+
+                    <div className="flex items-center justify-center">
+                      <button
+                        type="button"
+                        onClick={() => setIsQrScannerOpen((prev) => !prev)}
+                        className="w-full py-2.5 px-3 rounded-xl border border-emerald-600 bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-300 font-semibold text-xs flex items-center justify-center gap-2 transition"
+                      >
+                        <QrCode className="w-4 h-4 text-emerald-400" />
+                        {isQrScannerOpen ? 'Fermer le lecteur QR code' : 'Scanner le QR code d’invitation'}
+                      </button>
+                    </div>
+
+                    {isQrScannerOpen && (
+                      <div className="p-3 rounded-xl border border-slate-700 bg-slate-900 space-y-2">
+                        <div className="flex items-center justify-between text-xs text-slate-300 font-medium">
+                          <span className="flex items-center gap-1.5"><Camera className="w-3.5 h-3.5 text-emerald-400" /> Visez le QR code avec votre caméra</span>
+                          <button type="button" onClick={() => setIsQrScannerOpen(false)} className="text-slate-400 hover:text-white">✕</button>
+                        </div>
+                        <div id="qr-reader-container" className="rounded-lg overflow-hidden bg-black text-center min-h-[180px] flex items-center justify-center text-xs text-slate-400" />
+                        <p className="text-[11px] text-slate-400 text-center">Ou collez directement une image de QR code / invitation.</p>
+                      </div>
+                    )}
                     <div>
                       <label className="block text-xs font-semibold text-slate-300 mb-1">Identifiant professionnel</label>
                       <input
@@ -1684,6 +1788,18 @@ export default function App() {
         >
           <Lock className="w-3.5 h-3.5" />
           {t.channelsHeader}
+        </button>
+
+        <button
+          onClick={() => setActiveTab('instructions')}
+          className={`py-2.5 px-3.5 text-xs font-bold border-b-2 flex items-center gap-2 transition whitespace-nowrap ${
+            activeTab === 'instructions'
+              ? 'border-emerald-500 text-emerald-400 bg-emerald-950/20'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <ClipboardList className="w-3.5 h-3.5" />
+          {t.instructionsTab || 'Instructions officielles'}
         </button>
 
         <button
@@ -2132,6 +2248,139 @@ export default function App() {
       )}
 
       {/* ==================================================================== */}
+      {/* ONGLET INSTRUCTIONS OFFICIELLES & DIRECTIVES DE SERVICE               */}
+      {/* ==================================================================== */}
+      {activeTab === 'instructions' && (
+        <div className="flex-1 overflow-y-auto p-6 max-w-6xl w-full mx-auto space-y-6">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                <ClipboardList className="w-5 h-5 text-emerald-400" />
+                Tableau de Bord des Instructions Officielles & Directives d'État
+              </h2>
+              <p className="text-xs text-slate-400">
+                Suivi nominatif des consignes de service avec accusés de lecture probants signés en <strong>ECDSA P-256</strong>.
+              </p>
+            </div>
+          </div>
+
+          {/* Liste des instructions officielles déchiffrées */}
+          {(() => {
+            const instructionMessages = messages.filter(
+              (m) => m.requires_probative_receipt || (m.probative_receipts && m.probative_receipts.length > 0)
+            );
+
+            if (instructionMessages.length === 0) {
+              return (
+                <div className="flex flex-col items-center justify-center p-12 rounded-2xl border border-dashed border-slate-700 text-center space-y-3 bg-slate-900/40">
+                  <FileCheck2 className="w-10 h-10 text-emerald-400/60" />
+                  <div className="text-sm font-semibold text-white">Aucune instruction officielle en cours</div>
+                  <p className="text-xs text-slate-400 max-w-md">
+                    Pour émettre une instruction officielle, cochez « Demander une confirmation de lecture » lors de l'envoi d'un message dans une conversation.
+                  </p>
+                </div>
+              );
+            }
+
+            return (
+              <div className="grid grid-cols-1 gap-4">
+                {instructionMessages.map((msg) => {
+                  const dec = decryptedMap[msg.id];
+                  const textContent = dec ? dec.content.text : 'Instruction chiffrée E2EE en cours de déchiffrement...';
+                  const receiptsCount = msg.probative_receipts?.length || 0;
+                  const totalMembers = currentChannel?.active_members?.length || 1;
+                  const progressPct = Math.min(100, Math.round((receiptsCount / Math.max(1, totalMembers)) * 100));
+                  const hasSigned = msg.probative_receipts?.some((r) => r.agent_matricule === currentAgent?.matricule);
+                  const instReference = `INST-2026-${String(msg.channel_id).padStart(2, '0')}-${String(msg.id).padStart(4, '0')}`;
+
+                  return (
+                    <div
+                      key={msg.id}
+                      className="p-5 rounded-2xl border border-slate-700 bg-slate-900/90 shadow-sm space-y-4"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs font-bold px-2.5 py-1 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-700">
+                            {instReference}
+                          </span>
+                          <span className="text-xs text-slate-400">
+                            Canal : <strong>{channels.find((c) => c.id === msg.channel_id)?.name || 'Interministériel'}</strong>
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-800 text-amber-300 border border-slate-700">
+                            {msg.classification || 'DIFFUSION_RESTREINTE'}
+                          </span>
+                          {hasSigned ? (
+                            <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-600 flex items-center gap-1">
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Émargé par vous
+                            </span>
+                          ) : (
+                            <button
+                              onClick={() => handleSignProbativeReceipt(msg)}
+                              className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1 transition"
+                            >
+                              <FileCheck2 className="w-3.5 h-3.5" /> Confirmer la prise de connaissance
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Contenu textuel officiel de la directive */}
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 text-sm text-slate-100 font-serif leading-relaxed">
+                        {textContent}
+                      </div>
+
+                      {/* Barre de progression des accusés reçus */}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-xs text-slate-400">
+                          <span>Taux de prise de connaissance signée</span>
+                          <span className="font-mono font-bold text-emerald-400">
+                            {receiptsCount} / {totalMembers} agents ({progressPct}%)
+                          </span>
+                        </div>
+                        <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                          <div
+                            className="bg-emerald-500 h-full rounded-full transition-all duration-300"
+                            style={{ width: `${progressPct}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Liste nominative des signatures vérifiées */}
+                      {msg.probative_receipts && msg.probative_receipts.length > 0 && (
+                        <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                          <div className="text-[11px] font-semibold text-slate-400">
+                            Signatures cryptographiques ECDSA P-256 enregistrées :
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                            {msg.probative_receipts.map((r) => (
+                              <div
+                                key={r.id}
+                                className="p-2 rounded-lg bg-slate-950/70 border border-slate-800 text-[10px] flex items-center justify-between"
+                              >
+                                <span className="text-white font-medium">
+                                  ✓ {r.agent_full_name} ({r.agent_matricule})
+                                </span>
+                                <span className="text-emerald-400 font-mono">
+                                  {r.signature_hex.slice(0, 16)}...
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* ==================================================================== */}
       {/* ONGLET 2 : ANNUAIRE OFFICIEL PAR MINISTÈRE & FONCTION                */}
       {/* ==================================================================== */}
       {activeTab === 'directory' && (
@@ -2396,11 +2645,26 @@ export default function App() {
               </form>
 
               {enrolmentResult && (
-                <div className="mt-4 p-3.5 rounded-xl bg-emerald-950/60 border border-emerald-500 text-xs space-y-1">
+                <div className="mt-4 p-3.5 rounded-xl bg-emerald-950/60 border border-emerald-500 text-xs space-y-2.5">
                   <div className="font-bold text-emerald-300">
                     ✓ Invitation créée pour {enrolmentResult.matricule}
                   </div>
-                  <div className="text-emerald-100">Remettez uniquement ce code à l’agent par un canal institutionnel sûr. Il expire le {new Date(enrolmentResult.activation_expires_at).toLocaleString()}.</div>
+                  <div className="text-emerald-100">Remettez ce code ou faites scanner ce QR Code sécurisé à l’agent. Il expire le {new Date(enrolmentResult.activation_expires_at).toLocaleString()}.</div>
+                  
+                  {/* Affichage du QR code d'invitation sécurisé */}
+                  <div className="flex flex-col items-center justify-center p-3 rounded-xl bg-white border border-emerald-600 shadow-inner">
+                    <QRCodeSVG
+                      value={JSON.stringify({
+                        m: enrolmentResult.matricule,
+                        c: enrolmentResult.activation_code_once,
+                      })}
+                      size={180}
+                      level="M"
+                      includeMargin
+                    />
+                    <span className="text-[10px] text-slate-800 font-bold mt-1">QR Code d'Enrôlement — {enrolmentResult.matricule}</span>
+                  </div>
+
                   <div className="select-all break-all rounded-lg border border-emerald-700 bg-slate-950 p-3 font-mono text-sm text-amber-300">
                     {enrolmentResult.activation_code_once}
                   </div>

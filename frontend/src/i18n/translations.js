@@ -18,6 +18,7 @@ export const TRANSLATIONS = {
     e2eeActive: 'Messages protégés',
     zeroKnowledge: 'Messages visibles uniquement par les membres',
     channelsHeader: 'Messages',
+    instructionsTab: 'Instructions officielles',
     directoryTab: 'Annuaire',
     juryInspectorTab: 'Sécurité avancée',
     adminRevokeTab: 'Gestion des comptes',
