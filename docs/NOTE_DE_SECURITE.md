@@ -40,7 +40,8 @@ Conformément à l'interdiction stricte de toute cryptographie maison, **FASO-S�
 
 1. **Révocation en direct et exclusion cryptographique** : Lorsqu'un administrateur révoque un agent (`POST /api/admin/revoke/{id}`), le serveur invalide ses sessions (`token_version`), coupe son WebSocket (`4003`), et incrémente `crypto_epoch`. Les messages suivants étant chiffrés uniquement pour les membres actifs de l'époque `N+1`, l'agent révoqué ne peut plus rien déchiffrer.
    - **Garantie réaliste d'effacement (`REMOTE_WIPE`)** : En ligne, l'ordre WebSocket purge immédiatement le stockage local. Hors-ligne, l'accès aux nouveaux messages est coupé immédiatement et la purge locale s'exécute dès la première tentative de reconnexion.
-2. **Minimisation des métadonnées visibles par le serveur** :
-   - *Auteur d'un message* : Pseudonymisation par HMAC-SHA256 (`sender_pseudonym_hash`) avec secret poivré serveur.
+2. **Minimisation des métadonnées visibles par le serveur et limites de la pseudonymisation** :
+   - *Auteur d'un message* : Pseudonymisation par HMAC-SHA256 (`sender_pseudonym_hash`) avec secret poivré côté serveur.
+   - *Slots destinataires de l'enveloppe Signal* : Indexés par `SHA-256(prefix:channel:epoch:matricule)`. **Limite reconnue dans notre modèle de menace** : ces slots masquent les matricules dans le transport JSON mais constituent une pseudonymisation déterministe (vulnérable à une attaque par dictionnaire si l'espace des matricules est restreint), et non une anonymisation forte. Le routage serveur s'opère sans lecture des contenus.
    - *Horodatage* : Arrondi par tranches temporelles de 5 minutes (`timestamp_bucket`).
    - *Tailles* : Bourrage systématique à 256 octets (messages) et 4 096 octets (fichiers). Le serveur ne voit ni noms de fichiers, ni types MIME, ni textes clairs.
