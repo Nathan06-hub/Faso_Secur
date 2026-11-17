@@ -94,6 +94,20 @@ Le titulaire ouvre l'application sur son adresse HTTPS interne, choisit **« Act
 
 Pour un agent enrôlé par un administrateur, l'écran d'administration affiche seulement le code d'invitation. Si le code est perdu ou si l'activation est interrompue, un responsable peut le réémettre depuis la fiche du compte; l'ancien code et les sessions d'activation précédentes deviennent alors invalides. Pour récupérer l'activation initiale DGTD avant qu'un administrateur soit actif, un opérateur autorisé peut exécuter `bootstrap_admin.py --matricule BF-DGTD-001 --reissue-initial-admin` depuis la même console privée.
 
+## 🧪 Exécution des Tests de Sécurité & Cryptographiques
+
+Les 23 tests automatisés couvrent l'intégralité de la chaîne cryptographique (amorçage X3DH, Double Ratchet, 2FA Fernet, révocation et purge) :
+
+```bash
+# 1. Tests de sécurité backend (Pytest)
+cd backend
+pytest tests/test_security.py -v
+
+# 2. Tests de validation du moteur E2EE Signal (Node.js)
+cd frontend
+node tests/test_e2ee_engine.mjs
+```
+
 ---
 
 ## 6. Comptes Fictifs de Démonstration & Limites Connues Documentées
